@@ -52,7 +52,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$SkillRoot\manage-services-
 - **概览**：会话状态和主机信息
 - **终端**：受限的异步命令执行和实时输出
 - **任务**：查看、跟踪、取消和固定后台任务
-- **文件**：SFTP 文件浏览、上传、下载、删除和安全预览
+- **文件**：SFTP 文件浏览、上传、下载、重命名、删除空目录或文件，以及安全预览
 - **日志**：读取指定的远程日志
 
 ## Agent 接口

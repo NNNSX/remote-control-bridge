@@ -1,5 +1,7 @@
 # Node SSH Remote Control Skill 设计方案
 
+> 文档性质：历史设计方案和目标清单，不是当前实现的完整功能承诺。当前可用行为以 `README.md`、`SKILL.md`、`node/` 源码和测试为准；其中真实 WebSocket PTY、专用格式预览、冲突编辑和远端调度器适配仍属于设计目标。
+
 ## 1. 目的
 
 构建一个可被 Codex/Agent 使用的跨平台远程服务器管理 skill：
