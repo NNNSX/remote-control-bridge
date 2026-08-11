@@ -117,7 +117,7 @@ class SessionDaemonHandler(BaseHTTPRequestHandler):
                 self._json({
                     "authorized": True, "session": token, "host": session.host,
                     "port": session.port, "username": session.username,
-                    "expires_in_seconds": bridge.SESSION_TTL_SECONDS,
+                    **bridge.session_connection_policy(),
                 })
                 return
             if request.path == "/internal/v1/agent/terminals":
@@ -178,7 +178,7 @@ class SessionDaemonHandler(BaseHTTPRequestHandler):
                     "port": session.port,
                     "username": session.username,
                     "fingerprint": session.fingerprint,
-                    "expires_in_seconds": bridge.SESSION_TTL_SECONDS,
+                    **bridge.session_connection_policy(),
                     "status": status_data,
                 }, HTTPStatus.CREATED)
                 return
@@ -289,6 +289,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        server.state.close_all_sessions()
         server.server_close()
     return 0
 

@@ -15,7 +15,7 @@ import { createControlClient } from "./lib/control-client.mjs";
 import { mediaTypeForPath } from "./lib/file-media.mjs";
 import { decodeTextPreview, isKnownBinaryPath, MAX_IMAGE_PREVIEW_BYTES, MAX_TEXT_PREVIEW_BYTES } from "./lib/file-preview.mjs";
 import { RemoteTaskService } from "./lib/remote-task-service.mjs";
-import { createTerminal, ensureTerminal, sessionExpired, sessionExpiresInSeconds, SESSION_TTL_MS, touchSession } from "./lib/session-policy.mjs";
+import { createTerminal, ensureTerminal, sessionConnectionPolicy, sshKeepaliveOptions } from "./lib/session-policy.mjs";
 import { createSftpTaskRemote } from "./lib/sftp-task-remote.mjs";
 import { SftpTusStore } from "./lib/sftp-tus-store.mjs";
 import { TaskIndex, taskOwnerKey } from "./lib/task-index.mjs";
@@ -112,6 +112,7 @@ async function connectSsh(data) {
     const config = {
       host: data.host, port: Number(data.port || 22), username: data.username,
       readyTimeout: 90000,
+      ...sshKeepaliveOptions(),
       hostVerifier: (rawKey) => {
         const fp = fingerprintBuffer(crypto.createHash("sha256").update(rawKey).digest());
         if (known.has(fp)) { acceptedFingerprint = fp; return true; }
@@ -146,12 +147,11 @@ function requireKeyCache(file) {
 }
 
 function sessionBinding(session) { return { host: session.host, port: session.port, username: session.username, fingerprint: session.fingerprint }; }
-function closeSession(session) { if (session.taskReconcileTimer) clearTimeout(session.taskReconcileTimer); for (const job of session.jobs.values()) { job.cancel = true; job.stream?.close(); } try { session.client.end(); } catch {} sessions.delete(session.id); }
-function sessionInfo(session) { return { session: session.id, host: session.host, port: session.port, username: session.username, fingerprint: session.fingerprint, expires_in_seconds: sessionExpiresInSeconds(session) }; }
-function getSession(idValue) { const session = sessions.get(idValue); if (!session || sessionExpired(session)) { if (session) closeSession(session); throw new Error("unknown or expired session"); } return touchSession(session); }
+function closeSession(session, endClient = true) { if (session.taskReconcileTimer) clearTimeout(session.taskReconcileTimer); sessions.delete(session.id); for (const job of session.jobs.values()) { job.cancel = true; job.stream?.close(); } if (endClient) { try { session.client.end(); } catch {} } }
+function sessionInfo(session) { return { session: session.id, host: session.host, port: session.port, username: session.username, fingerprint: session.fingerprint, ...sessionConnectionPolicy() }; }
+function getSession(idValue) { const session = sessions.get(idValue); if (!session) throw new Error("unknown or disconnected session"); return session; }
 async function agentSession(scope) {
   for (const session of [...sessions.values()].reverse()) {
-    if (sessionExpired(session)) { closeSession(session); continue; }
     let authorization;
     try { authorization = await control.authorize(sessionBinding(session)); }
     catch { session.agentEnabled = false; continue; }
@@ -159,16 +159,12 @@ async function agentSession(scope) {
     const allowed = Boolean(authorization.authorized && grant?.scopes?.includes(scope));
     session.agentEnabled = allowed;
     session.controlGrantId = allowed ? grant.grant_id : null;
-    if (allowed) return touchSession(session);
+    if (allowed) return session;
   }
   const error = new Error(`no Agent-authorized SSH session includes ${scope}`);
   error.status_code = 403;
   throw error;
 }
-
-setInterval(() => {
-  for (const session of sessions.values()) if (sessionExpired(session)) closeSession(session);
-}, 30000).unref();
 
 function execOnce(client, command) {
   return new Promise((resolve, reject) => client.exec(command, (error, stream) => {
@@ -458,7 +454,7 @@ const server = http.createServer(async (request, response) => {
       const scope = agentScopeForRequest(request.method, suffix);
       if (!scope) return json(response, 404, { error: "unknown Agent endpoint" });
       const session = await agentSession(scope);
-      if (request.method === "GET" && suffix === "session") return json(response, 200, { session: session.id, host: session.host, port: session.port, username: session.username, enabled: true });
+      if (request.method === "GET" && suffix === "session") return json(response, 200, { session: session.id, host: session.host, port: session.port, username: session.username, enabled: true, ...sessionConnectionPolicy() });
       if (request.method === "GET" && suffix === "status") return json(response, 200, { ...(await collectStatus(session)), session: session.id });
       if (request.method === "GET" && suffix === "terminals") return json(response, 200, { session: session.id, terminals: [...session.terminals.values()].map((terminal) => ({ ...terminal, jobs: terminal.jobs.map(jobInfo) })) });
       if (request.method === "POST" && suffix === "commands") return json(response, 202, startJob(session, await readBody(request)));
@@ -501,14 +497,14 @@ const server = http.createServer(async (request, response) => {
       const data = await readBody(request);
       const connection = await connectSsh(data);
       try {
-        const session = { id: id("session"), client: connection.client, host: data.host, port: Number(data.port || 22), username: data.username, fingerprint: connection.fingerprint, jobs: new Map(), terminals: new Map([["term-1", { terminal_id: "term-1", index: 1, busy: false, current_job_id: null, jobs: [] }]]), agentEnabled: false, controlGrantId: null, expiresAt: Date.now() + SESSION_TTL_MS };
+        const session = { id: id("session"), client: connection.client, host: data.host, port: Number(data.port || 22), username: data.username, fingerprint: connection.fingerprint, jobs: new Map(), terminals: new Map([["term-1", { terminal_id: "term-1", index: 1, busy: false, current_job_id: null, jobs: [] }]]), agentEnabled: false, controlGrantId: null };
         const authorization = await control.authorize(sessionBinding(session));
         session.agentEnabled = Boolean(authorization.authorized && agentGrantScopes.every((scope) => authorization.grant?.scopes?.includes(scope)));
         session.controlGrantId = session.agentEnabled ? authorization.grant.grant_id : null;
         sessions.set(session.id, session);
         scheduleTaskReconcile(session);
         session.client.once("close", () => {
-          if (sessions.has(session.id)) closeSession(session);
+          if (sessions.has(session.id)) closeSession(session, false);
         });
         return json(response, 201, { ...sessionInfo(session), status: await collectStatus(session) });
       } catch (error) {
@@ -570,6 +566,9 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.listen(port, "127.0.0.1", () => process.stdout.write(`${JSON.stringify({ ok: true, mode: "ssh-session-daemon", url: `http://127.0.0.1:${server.address().port}` })}\n`));
-function shutdown() { server.close(() => { try { localTaskIndex?.close(); } catch {} process.exit(0); }); }
+function shutdown() {
+  for (const session of [...sessions.values()]) closeSession(session);
+  server.close(() => { try { localTaskIndex?.close(); } catch {} process.exit(0); });
+}
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);

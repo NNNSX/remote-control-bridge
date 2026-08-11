@@ -57,7 +57,7 @@ class SessionDaemonTests(unittest.TestCase):
         self.assertEqual(status, 403)
 
     def test_open_session_does_not_persist_password(self) -> None:
-        live = sessiond.bridge.LiveSession(mock.MagicMock(), "192.0.2.10", 22, "remote-user", None, 999999.0, "SHA256:test")
+        live = sessiond.bridge.LiveSession(mock.MagicMock(), "192.0.2.10", 22, "remote-user", None, fingerprint="SHA256:test")
         with mock.patch.object(self.state, "open_session", return_value=("temporary-session-token", live)) as opened, mock.patch.object(
             sessiond.bridge, "collect_session_status", return_value={"hostname": "amax"}
         ):
@@ -68,6 +68,10 @@ class SessionDaemonTests(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertEqual(payload["session"], "temporary-session-token")
         self.assertEqual(payload["status"]["hostname"], "amax")
+        self.assertIsNone(payload["expires_in_seconds"])
+        self.assertFalse(payload["idle_timeout_enabled"])
+        self.assertEqual(payload["keepalive_interval_seconds"], 30)
+        self.assertEqual(payload["keepalive_failure_threshold"], 10)
         self.assertEqual(opened.call_args.args[0]["password"], "temporary-only")
         self.assertFalse(hasattr(live, "password"))
 

@@ -11,6 +11,8 @@ Remote Control Bridge 是一个面向 Codex 和本地 Agent 的远程 SSH 工作
 - 支持临时密码和 Ed25519 私钥认证
 - 首次连接时显示并确认 SSH 主机指纹
 - 浏览器刷新后可恢复仍然有效的会话
+- 使用 SSH 协议保活维持空闲连接，不因网页或 Agent 暂时无操作而自动断开
+- 用户主动断开、连接持续失联或 Session 服务退出时清理会话
 - Bridge、Session 和 Control 分离，减少单个服务重启的影响
 
 ### 主机状态

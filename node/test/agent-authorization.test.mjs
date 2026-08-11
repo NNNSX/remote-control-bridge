@@ -114,6 +114,10 @@ test("Agent access requires a fingerprint-bound Control grant and revokes immedi
   assert.equal(response.status, 201);
   const created = await response.json();
   assert.match(created.fingerprint, /^SHA256:/);
+  assert.equal(created.expires_in_seconds, null);
+  assert.equal(created.idle_timeout_enabled, false);
+  assert.equal(created.keepalive_interval_seconds, 30);
+  assert.equal(created.keepalive_failure_threshold, 10);
   const sessionId = created.session;
 
   response = await fetch(`${api}/agent/session`);
@@ -127,7 +131,11 @@ test("Agent access requires a fingerprint-bound Control grant and revokes immedi
   const activeGrant = Object.values(grants).find((grant) => !grant.revoked);
   assert.deepEqual(activeGrant.scopes, ["files:read", "jobs:cancel", "jobs:execute", "jobs:read", "status:read", "tasks:cancel", "tasks:execute", "tasks:read"]);
   assert.equal(activeGrant.scopes.includes("files:write"), false);
-  assert.equal((await fetch(`${api}/agent/session`)).status, 200);
+  response = await fetch(`${api}/agent/session`);
+  assert.equal(response.status, 200);
+  const discovered = await response.json();
+  assert.equal(discovered.expires_in_seconds, null);
+  assert.equal(discovered.idle_timeout_enabled, false);
 
   response = await fetch(`${api}/agent/tasks/capabilities`);
   assert.equal(response.status, 200);

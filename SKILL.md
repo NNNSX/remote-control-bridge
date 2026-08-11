@@ -48,7 +48,9 @@ Open `http://127.0.0.1:8877/` after all services report running.
 - Treat the task GPU panel as an observation, not process attribution. New tasks with a numeric `CUDA_VISIBLE_DEVICES` store only normalized physical indices in `manifest.resources`; the complete environment and opaque selectors are not copied to the manifest. Old or unmappable records show an explicitly unbound host snapshot.
 - Treat storage cleanup in Tasks as preview-only. Pin/unpin and task cancellation are available, but the browser intentionally exposes no task-record deletion control.
 - A fresh browser tab may recover the existing SSH session through `GET /api/v1/agent/session` only while the user-authorized, fingerprint-bound Agent grant is active. This recovery does not retrieve or persist an SSH password; otherwise use the normal connection form.
-- Expect a 15-minute sliding idle lifetime for SSH sessions and at most four reusable terminal slots per session.
+- Expect SSH protocol keepalives instead of an application idle timeout. Browser inactivity, Agent inactivity, and periods without commands must not close an otherwise healthy SSH connection.
+- Expect Session to close a connection only after an explicit user disconnect, Session shutdown, or the SSH transport declaring sustained keepalive failure. Do not promise automatic reconnection after a real transport loss because connection passwords are never persisted.
+- Use at most four reusable terminal slots per session.
 - Refresh the page for frontend-only changes. Restart Bridge for API proxy changes, Session for SSH/session changes, and Control for authorization changes.
 
 ## Use scoped Agent access

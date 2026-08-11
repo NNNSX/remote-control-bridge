@@ -149,7 +149,7 @@ class SessionTests(unittest.TestCase):
     def test_busy_terminal_allocates_a_bounded_parallel_slot(self) -> None:
         state = bridge.BridgeState(self.config)
         token = "temporary-session-token"
-        session = bridge.LiveSession(mock.MagicMock(), "192.0.2.10", 22, "remote-user", None, time.monotonic() + 60)
+        session = bridge.LiveSession(mock.MagicMock(), "192.0.2.10", 22, "remote-user", None)
         state.sessions[token] = session
         gate = threading.Event()
 
@@ -171,7 +171,7 @@ class SessionTests(unittest.TestCase):
     def test_running_job_can_be_cancelled_and_releases_terminal(self) -> None:
         state = bridge.BridgeState(self.config)
         token = "temporary-session-token"
-        session = bridge.LiveSession(mock.MagicMock(), "192.0.2.10", 22, "remote-user", None, time.monotonic() + 60)
+        session = bridge.LiveSession(mock.MagicMock(), "192.0.2.10", 22, "remote-user", None)
         state.sessions[token] = session
 
         def run(state_arg, token_arg, job):
@@ -193,7 +193,7 @@ class SessionTests(unittest.TestCase):
     def test_timeout_has_a_distinct_terminal_state(self) -> None:
         state = bridge.BridgeState(self.config)
         token = "temporary-session-token"
-        state.sessions[token] = bridge.LiveSession(mock.MagicMock(), "192.0.2.10", 22, "remote-user", None, time.monotonic() + 60)
+        state.sessions[token] = bridge.LiveSession(mock.MagicMock(), "192.0.2.10", 22, "remote-user", None)
         with mock.patch.object(bridge, "_execute_command_job", side_effect=bridge.JobTimedOut()):
             submitted = bridge.submit_session_command(state, token, {"command": "sleep 60", "timeout_seconds": 1})
             deadline = time.monotonic() + 1
@@ -204,7 +204,7 @@ class SessionTests(unittest.TestCase):
     def test_global_concurrency_limit_is_enforced(self) -> None:
         state = bridge.BridgeState(self.config)
         token = "temporary-session-token"
-        state.sessions[token] = bridge.LiveSession(mock.MagicMock(), "192.0.2.10", 22, "remote-user", None, time.monotonic() + 60)
+        state.sessions[token] = bridge.LiveSession(mock.MagicMock(), "192.0.2.10", 22, "remote-user", None)
         state.active_jobs = bridge.MAX_GLOBAL_ACTIVE_JOBS
         with self.assertRaises(bridge.ConflictError):
             bridge.submit_session_command(state, token, {"command": "hostname"})
@@ -217,6 +217,7 @@ class SessionTests(unittest.TestCase):
 
     def test_password_is_not_stored_in_live_session(self) -> None:
         fake_client = mock.MagicMock()
+        fake_client.get_transport.return_value.is_active.return_value = True
         fake_paramiko = mock.MagicMock()
         fake_paramiko.SSHClient.return_value = fake_client
         with mock.patch.object(bridge, "paramiko", fake_paramiko):
@@ -227,12 +228,46 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(hasattr(session, "password"))
         self.assertNotIn("not-persisted", repr(session))
         self.assertEqual(fake_client.connect.call_args.kwargs["password"], "not-persisted")
+        fake_client.get_transport.return_value.set_keepalive.assert_called_once_with(bridge.SSH_KEEPALIVE_INTERVAL_SECONDS)
         state.close_session(token)
+
+    def test_idle_session_has_no_application_expiry(self) -> None:
+        state = bridge.BridgeState(self.config)
+        token = "temporary-session-token"
+        client = mock.MagicMock()
+        client.get_transport.return_value.is_active.return_value = True
+        session = bridge.LiveSession(client, "192.0.2.10", 22, "remote-user", None, opened_at=1.0)
+        state.sessions[token] = session
+        with mock.patch.object(bridge.time, "monotonic", return_value=10**9):
+            self.assertIs(state.session(token), session)
+        self.assertIn(token, state.sessions)
+
+    def test_disconnected_session_is_removed_on_access(self) -> None:
+        state = bridge.BridgeState(self.config)
+        token = "temporary-session-token"
+        client = mock.MagicMock()
+        client.get_transport.return_value.is_active.return_value = False
+        state.sessions[token] = bridge.LiveSession(client, "192.0.2.10", 22, "remote-user", None)
+        with self.assertRaisesRegex(KeyError, "disconnected"):
+            state.session(token)
+        self.assertNotIn(token, state.sessions)
+        client.close.assert_called_once()
+
+    def test_asyncssh_connection_uses_bounded_keepalive_failures(self) -> None:
+        state = bridge.BridgeState(self.config)
+        request = bridge._session_request(self.request)
+        connection = object()
+        with mock.patch.object(bridge.asyncssh, "connect", return_value="awaitable") as connect, mock.patch.object(
+            state, "run_async", return_value=connection
+        ):
+            self.assertIs(state._connect_asyncssh(request), connection)
+        self.assertEqual(connect.call_args.kwargs["keepalive_interval"], bridge.SSH_KEEPALIVE_INTERVAL_SECONDS)
+        self.assertEqual(connect.call_args.kwargs["keepalive_count_max"], bridge.SSH_KEEPALIVE_COUNT_MAX)
 
     def test_agent_access_requires_explicit_session_authorization(self) -> None:
         state = bridge.BridgeState(self.config)
         token = "temporary-session-token"
-        session = bridge.LiveSession(mock.MagicMock(), "192.0.2.10", 22, "remote-user", None, time.monotonic() + 60)
+        session = bridge.LiveSession(mock.MagicMock(), "192.0.2.10", 22, "remote-user", None)
         state.sessions[token] = session
         with self.assertRaises(KeyError):
             state.agent_session()

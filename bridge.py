@@ -53,7 +53,8 @@ HOST_KEYS = {"name", "target", "workdir", "logs", "artifact_root", "artifacts"}
 LOG_KEYS = {"name", "path", "max_lines"}
 ARTIFACT_KEYS = {"name", "url", "sha256", "destination", "max_bytes"}
 STATIC_FILES = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/app.css": "app.css"}
-SESSION_TTL_SECONDS = 15 * 60
+SSH_KEEPALIVE_INTERVAL_SECONDS = 30
+SSH_KEEPALIVE_COUNT_MAX = 10
 AUTH_TIMEOUT_SECONDS = 90
 SESSION_OPEN_PROXY_TIMEOUT_SECONDS = 210
 DEFAULT_SSH_KEY_PATH = Path.home() / ".ssh" / "id_ed25519"
@@ -64,6 +65,17 @@ MAX_COMMAND_TIMEOUT_SECONDS = 3600
 MAX_TERMINALS_PER_SESSION = 4
 MAX_GLOBAL_ACTIVE_JOBS = 8
 MAX_JOB_EVENTS = 512
+
+
+def session_connection_policy() -> dict[str, Any]:
+    return {
+        "expires_in_seconds": None,
+        "idle_timeout_enabled": False,
+        "keepalive_interval_seconds": SSH_KEEPALIVE_INTERVAL_SECONDS,
+        "keepalive_failure_threshold": SSH_KEEPALIVE_COUNT_MAX,
+    }
+
+
 SENSITIVE_SEGMENTS = {".aws", ".git", ".gnupg", ".kube", ".ssh", "authorized_keys", "credentials", "credentials.json", "id_dsa", "id_ecdsa", "id_ed25519", "id_rsa", "known_hosts", "secrets", "secrets.json", ".netrc"}
 SENSITIVE_SUFFIXES = (".key", ".p12", ".pem", ".pfx")
 STATUS_SCRIPT = r'''#!/bin/sh
@@ -612,9 +624,9 @@ class LiveSession:
     port: int
     username: str
     workdir: str | None
-    expires_at: float
     fingerprint: str = ""
     backend: str = "paramiko"
+    opened_at: float = field(default_factory=time.monotonic)
     agent_enabled: bool = False
     control_grant_id: str | None = None
     terminals: dict[str, TerminalSlot] = field(default_factory=dict, repr=False)
@@ -664,10 +676,19 @@ class BridgeState:
     def public_hosts(self) -> list[dict[str, Any]]:
         return [{"name": host["name"], "target": host["target"], "workdir": host["workdir"], "logs": [item["name"] for item in host["logs"]], "artifacts": [item["name"] for item in host["artifacts"]]} for host in self.config["hosts"]]
 
-    def _cleanup_sessions(self) -> None:
-        now = time.monotonic()
-        expired = [token for token, session in self.sessions.items() if session.expires_at <= now and not any(terminal.busy for terminal in session.terminals.values())]
-        for token in expired:
+    @staticmethod
+    def _session_active(session: LiveSession) -> bool:
+        try:
+            if session.backend == "asyncssh":
+                return not session.client.is_closed()
+            transport = session.client.get_transport()
+            return transport is not None and bool(transport.is_active())
+        except (AttributeError, OSError):
+            return False
+
+    def _cleanup_disconnected_sessions(self) -> None:
+        disconnected = [token for token, session in self.sessions.items() if not self._session_active(session)]
+        for token in disconnected:
             self._close_client(self.sessions.pop(token))
 
     def _ensure_async_loop(self) -> asyncio.AbstractEventLoop:
@@ -771,7 +792,8 @@ class BridgeState:
                 known_hosts=str(self.host_keys_path), client_keys=[str(DEFAULT_SSH_KEY_PATH)] if key_auth else [], agent_path=None,
                 public_key_auth=key_auth, password_auth=not key_auth, kbdint_auth=False,
                 preferred_auth=("publickey",) if key_auth else ("password",), connect_timeout=self.config["connect_timeout"],
-                login_timeout=AUTH_TIMEOUT_SECONDS,
+                login_timeout=AUTH_TIMEOUT_SECONDS, keepalive_interval=SSH_KEEPALIVE_INTERVAL_SECONDS,
+                keepalive_count_max=SSH_KEEPALIVE_COUNT_MAX,
             ),
             AUTH_TIMEOUT_SECONDS + self.config["connect_timeout"] + 5,
         )
@@ -807,6 +829,11 @@ class BridgeState:
                     look_for_keys=False, allow_agent=False, timeout=self.config["connect_timeout"],
                     banner_timeout=self.config["connect_timeout"], auth_timeout=AUTH_TIMEOUT_SECONDS,
                 )
+                transport = client.get_transport()
+                if transport is None or not transport.is_active():
+                    client.close()
+                    raise BridgeError("SSH connection closed before session initialization")
+                transport.set_keepalive(SSH_KEEPALIVE_INTERVAL_SECONDS)
         except paramiko.BadHostKeyException as exc:
             client.close()
             raise BridgeError("SSH host key changed; verify the server fingerprint before reconnecting") from exc
@@ -830,7 +857,7 @@ class BridgeState:
         token = secrets.token_urlsafe(32)
         session = LiveSession(
             client=client, host=request["host"], port=request["port"], username=request["username"],
-            fingerprint=fingerprint, workdir=request["workdir"], expires_at=time.monotonic() + SESSION_TTL_SECONDS, backend=backend,
+            fingerprint=fingerprint, workdir=request["workdir"], backend=backend,
         )
         if self.control.enabled:
             binding = {"host": session.host, "port": session.port, "username": session.username, "fingerprint": session.fingerprint}
@@ -839,17 +866,16 @@ class BridgeState:
             grant = auth.get("grant") or {}
             session.control_grant_id = grant.get("grant_id") if isinstance(grant, dict) else None
         with self.session_lock:
-            self._cleanup_sessions()
+            self._cleanup_disconnected_sessions()
             self.sessions[token] = session
         return token, session
 
     def session(self, token: str) -> LiveSession:
         with self.session_lock:
-            self._cleanup_sessions()
+            self._cleanup_disconnected_sessions()
             session = self.sessions.get(token)
             if session is None:
-                raise KeyError("unknown or expired session")
-            session.expires_at = time.monotonic() + SESSION_TTL_SECONDS
+                raise KeyError("unknown or disconnected session")
             return session
 
     def set_agent_enabled(self, token: str, enabled: bool) -> LiveSession:
@@ -874,7 +900,7 @@ class BridgeState:
 
     def agent_session(self) -> tuple[str, LiveSession]:
         with self.session_lock:
-            self._cleanup_sessions()
+            self._cleanup_disconnected_sessions()
             enabled = [(token, session) for token, session in self.sessions.items() if session.agent_enabled]
             if self.control.enabled:
                 enabled = []
@@ -893,16 +919,22 @@ class BridgeState:
                         enabled.append((token, session))
             if not enabled:
                 raise KeyError("no session is authorized for the local agent")
-            token, session = max(enabled, key=lambda item: item[1].expires_at)
-            session.expires_at = time.monotonic() + SESSION_TTL_SECONDS
+            token, session = max(enabled, key=lambda item: item[1].opened_at)
             return token, session
 
     def close_session(self, token: str) -> None:
         with self.session_lock:
             session = self.sessions.pop(token, None)
         if session is None:
-            raise KeyError("unknown or expired session")
+            raise KeyError("unknown or disconnected session")
         self._close_client(session)
+
+    def close_all_sessions(self) -> None:
+        with self.session_lock:
+            sessions = list(self.sessions.values())
+            self.sessions.clear()
+        for session in sessions:
+            self._close_client(session)
 
 
 def _truncate_output(value: str) -> tuple[str, bool]:
@@ -1170,7 +1202,6 @@ def submit_session_command(state: BridgeState, token: str, data: Any) -> dict[st
             _set_job_status(job, status)
             terminal.busy = False
             terminal.current_job_id = None
-            session.expires_at = time.monotonic() + SESSION_TTL_SECONDS
         _publish_job_event(job, "end", {"status": status, "exit_status": result["exit_status"], "duration_ms": result["duration_ms"], "truncated": result["truncated"]})
         with state.active_jobs_lock:
             state.active_jobs -= 1
@@ -1442,7 +1473,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     self._json(result, status)
                     return
                 _, session = self.server.state.agent_session()
-                self._json({"authorized": True, "host": session.host, "port": session.port, "username": session.username, "expires_in_seconds": SESSION_TTL_SECONDS})
+                self._json({"authorized": True, "host": session.host, "port": session.port, "username": session.username, **session_connection_policy()})
                 return
             if request.path == "/api/v1/agent/terminals":
                 if query:
@@ -1535,7 +1566,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 except BaseException:
                     self.server.state.close_session(token)
                     raise
-                self._json({"session": token, "expires_in_seconds": SESSION_TTL_SECONDS, "status": status_data}, HTTPStatus.CREATED)
+                self._json({"session": token, **session_connection_policy(), "status": status_data}, HTTPStatus.CREATED)
                 return
             session_logs = re.fullmatch(r"/api/v1/sessions/([A-Za-z0-9_-]{20,80})/logs", path)
             if session_logs:
@@ -1688,6 +1719,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        server.state.close_all_sessions()
         server.server_close()
     return 0
 

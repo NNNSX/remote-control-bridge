@@ -1,17 +1,21 @@
 export const MAX_TERMINALS = 4;
-export const SESSION_TTL_MS = 15 * 60 * 1000;
+export const SSH_KEEPALIVE_INTERVAL_MS = 30 * 1000;
+export const SSH_KEEPALIVE_COUNT_MAX = 10;
 
-export function touchSession(session, now = Date.now()) {
-  session.expiresAt = now + SESSION_TTL_MS;
-  return session;
+export function sshKeepaliveOptions() {
+  return {
+    keepaliveInterval: SSH_KEEPALIVE_INTERVAL_MS,
+    keepaliveCountMax: SSH_KEEPALIVE_COUNT_MAX,
+  };
 }
 
-export function sessionExpired(session, now = Date.now()) {
-  return !Number.isFinite(session.expiresAt) || session.expiresAt <= now;
-}
-
-export function sessionExpiresInSeconds(session, now = Date.now()) {
-  return Math.max(0, Math.ceil((session.expiresAt - now) / 1000));
+export function sessionConnectionPolicy() {
+  return {
+    expires_in_seconds: null,
+    idle_timeout_enabled: false,
+    keepalive_interval_seconds: SSH_KEEPALIVE_INTERVAL_MS / 1000,
+    keepalive_failure_threshold: SSH_KEEPALIVE_COUNT_MAX,
+  };
 }
 
 export function createTerminal(session, idFactory) {
