@@ -8,6 +8,8 @@ Remote Control Bridge 是一个只监听本机回环地址的 SSH 管理 skill�
 
 推荐使用 Node.js 版本，要求 Node.js 20 或更高版本。
 
+### Windows
+
 ```powershell
 cd remote-control-bridge
 $SkillRoot = (Resolve-Path ".").Path
@@ -19,12 +21,27 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$SkillRoot\manage-services-
 powershell -NoProfile -ExecutionPolicy Bypass -File "$SkillRoot\manage-services-node.ps1" Status All
 ```
 
+### Linux 和 macOS
+
+```bash
+cd remote-control-bridge
+npm ci --prefix node
+node node/manage-services-node.mjs Start All
+node node/manage-services-node.mjs Status All
+```
+
 然后在本机浏览器打开：`http://127.0.0.1:8877/`
 
-停止服务：
+Windows 停止服务：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "$SkillRoot\manage-services-node.ps1" Stop All
+```
+
+Linux 和 macOS 停止服务：
+
+```bash
+node node/manage-services-node.mjs Stop All
 ```
 
 服务默认端口：
@@ -35,7 +52,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$SkillRoot\manage-services-
 | Control | 8878 | Agent 授权控制 |
 | Session | 8879 | SSH 会话、终端和任务 |
 
-三个服务都运行在宿主机上。请从普通的宿主机 PowerShell 启动，不要从受限的 Codex 沙箱启动 SSH 服务。
+三个服务都运行在宿主机上。请从普通的宿主机终端启动：Windows 使用 PowerShell 或 Node 启动器，Linux 和 macOS 使用 Node 启动器。不要从受限的 Codex 沙箱启动 SSH 服务。
+
+## 平台支持
+
+- **本机 Bridge**：代码使用 Node.js 跨平台 API，可在 Windows、Linux 和 macOS 上运行。
+- **Windows 管理入口**：提供 `manage-services-node.ps1`。
+- **通用管理入口**：提供 `node/manage-services-node.mjs`，供 Windows、Linux 和 macOS 直接调用。
+- **远端 SSH 主机**：基础 SSH 和 SFTP 面向 POSIX 路径；主机监控与持久任务依赖 Linux 的 `/proc`、`bash`、`awk`、`setsid` 或 `systemd-run`。远端 Windows 目前不属于完整支持范围。
+- **验证范围**：通用 Node 服务和启动测试已覆盖核心进程，但仓库尚未配置 Windows、Linux、macOS 的自动化 CI 矩阵，因此不能把三平台都描述为完整实机验收。
 
 ## 连接远程服务器
 
@@ -92,12 +117,24 @@ Agent 默认不能上传、写入、重命名或删除文件。需要用户确�
 powershell -NoProfile -ExecutionPolicy Bypass -File "$SkillRoot\manage-services-node.ps1" Restart All -EnablePersistentTasks
 ```
 
+Linux 和 macOS：
+
+```bash
+node node/manage-services-node.mjs Restart All --persistent-tasks true
+```
+
 任务创建后立即返回 `task_id`，不会因为浏览器关闭、SSH 观察连接断开或 Agent 观察超时而自动取消。之后可以通过网页“任务”标签或 Agent 接口按任务 ID 查看状态和日志。
 
 删除 Bridge 自己的任务记录是单独的默认关闭功能：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "$SkillRoot\manage-services-node.ps1" Restart All -EnablePersistentTasks -EnableRemoteTaskDeletion
+```
+
+Linux 和 macOS：
+
+```bash
+node node/manage-services-node.mjs Restart All --persistent-tasks true --remote-task-deletion true
 ```
 
 任务记录只保存执行元数据、状态和受限日志。Bridge 不理解训练、模型、数据集或 checkpoint 等领域概念，也不会自动删除或恢复用户文件。
@@ -140,6 +177,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\manage-services-node.ps1 R
 powershell -NoProfile -ExecutionPolicy Bypass -File .\manage-services-node.ps1 Restart Control
 ```
 
+Linux 和 macOS 使用相同的服务名称：
+
+```bash
+node node/manage-services-node.mjs Restart Bridge
+node node/manage-services-node.mjs Restart Session
+node node/manage-services-node.mjs Restart Control
+```
+
 如果网页提示 `connect EACCES <host>:22`，通常是服务从受限网络环境启动。请从普通宿主机 PowerShell 停止并重新启动服务；这不是 SSH 密码错误。
 
 ## 安全边界
@@ -160,10 +205,4 @@ cd node
 npm test
 ```
 
-更多设计和迁移记录：
-
-- [`SKILL.md`](SKILL.md)：Codex skill 使用说明
-- [`NODE_SSH_SKILL_DESIGN.md`](NODE_SSH_SKILL_DESIGN.md)：Node.js 架构设计
-- [`PERSISTENT_TASK_PLAN.md`](PERSISTENT_TASK_PLAN.md)：持久任务设计
-- [`FINAL_REFACTOR_PLAN.md`](FINAL_REFACTOR_PLAN.md)：重构记录
-- [`UI_QA_CHECKLIST.md`](UI_QA_CHECKLIST.md)：界面验收清单
+Codex 和 Agent 的详细使用规则见 [`SKILL.md`](SKILL.md)。

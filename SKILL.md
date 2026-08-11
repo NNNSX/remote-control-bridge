@@ -11,6 +11,7 @@ description: Operate user-authorized SSH hosts through a loopback-only Node.js b
 - Ask the user to start, restart, or stop them from a normal host terminal. Never launch them from a Codex or sandboxed shell.
 - Never make direct SSH connections from the sandbox. Use the loopback API only after the host services are running.
 - Diagnose `connect EACCES host:22` as a host launch-context or network-policy failure before authentication.
+- Distinguish the local host from the remote target: the Node.js services and generic launcher are intended for Windows, Linux, and macOS, while remote metrics and Persistent Tasks currently require a Linux/POSIX host with `/proc`, Bash, and the probed launcher utilities. Do not claim full remote-Windows support.
 
 ## Prepare the runtime
 
