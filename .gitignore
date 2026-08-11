@@ -10,3 +10,11 @@ node-data/
 *.pid.json
 *.key
 control_grants.json
+
+# Internal planning and review notes; keep them out of public skill bundles.
+FINAL_REFACTOR_PLAN.md
+NODE_SSH_SKILL_DESIGN.md
+OPTIMIZATION_PLAN.md
+PERSISTENT_TASK_PLAN.md
+PRODUCT_POSITIONING.md
+UI_QA_CHECKLIST.md
