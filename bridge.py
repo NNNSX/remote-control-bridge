@@ -55,6 +55,9 @@ ARTIFACT_KEYS = {"name", "url", "sha256", "destination", "max_bytes"}
 STATIC_FILES = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/app.css": "app.css"}
 SSH_KEEPALIVE_INTERVAL_SECONDS = 30
 SSH_KEEPALIVE_COUNT_MAX = 10
+AGENT_GRANT_TTL_SECONDS = 24 * 60 * 60
+AGENT_GRANT_RENEW_INTERVAL_SECONDS = 12 * 60 * 60
+AGENT_GRANT_RETRY_SECONDS = 60
 AUTH_TIMEOUT_SECONDS = 90
 SESSION_OPEN_PROXY_TIMEOUT_SECONDS = 210
 DEFAULT_SSH_KEY_PATH = Path.home() / ".ssh" / "id_ed25519"
@@ -172,6 +175,9 @@ class ControlClient:
 
     def grant(self, binding: dict[str, Any], scopes: list[str], ttl_seconds: int = 86400) -> dict[str, Any]:
         return self._post("/api/v1/grants", {"binding": binding, "scopes": scopes, "ttl_seconds": ttl_seconds})
+
+    def renew(self, grant_id: str, binding: dict[str, Any], ttl_seconds: int = 86400) -> dict[str, Any]:
+        return self._post("/api/v1/grants/renew", {"grant_id": grant_id, "binding": binding, "ttl_seconds": ttl_seconds})
 
     def authorize(self, binding: dict[str, Any]) -> dict[str, Any]:
         return self._post("/api/v1/authorize", {"binding": binding})
@@ -629,6 +635,9 @@ class LiveSession:
     opened_at: float = field(default_factory=time.monotonic)
     agent_enabled: bool = False
     control_grant_id: str | None = None
+    control_grant_expires_at: int | None = None
+    agent_renew_timer: threading.Timer | None = field(default=None, repr=False)
+    agent_renew_last_error: str | None = None
     terminals: dict[str, TerminalSlot] = field(default_factory=dict, repr=False)
     jobs: dict[str, CommandJob] = field(default_factory=dict, repr=False)
     terminal_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -689,7 +698,9 @@ class BridgeState:
     def _cleanup_disconnected_sessions(self) -> None:
         disconnected = [token for token, session in self.sessions.items() if not self._session_active(session)]
         for token in disconnected:
-            self._close_client(self.sessions.pop(token))
+            session = self.sessions.pop(token)
+            self._revoke_agent_grant(session)
+            self._close_client(session)
 
     def _ensure_async_loop(self) -> asyncio.AbstractEventLoop:
         with self.async_loop_lock:
@@ -724,6 +735,70 @@ class BridgeState:
             self.async_loop.call_soon_threadsafe(session.client.close)
         else:
             session.client.close()
+
+    @staticmethod
+    def _session_binding(session: LiveSession) -> dict[str, Any]:
+        return {"host": session.host, "port": session.port, "username": session.username, "fingerprint": session.fingerprint}
+
+    @staticmethod
+    def _stop_agent_renewal(session: LiveSession) -> None:
+        timer = session.agent_renew_timer
+        session.agent_renew_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _schedule_agent_renewal(self, session: LiveSession, delay_seconds: int = AGENT_GRANT_RENEW_INTERVAL_SECONDS) -> None:
+        self._stop_agent_renewal(session)
+        if not self.control.enabled or not session.agent_enabled or not session.control_grant_id:
+            return
+
+        def renew() -> None:
+            with self.session_lock:
+                if session.agent_renew_timer is timer:
+                    session.agent_renew_timer = None
+                registered = any(item is session for item in self.sessions.values())
+                grant_id = session.control_grant_id
+                enabled = session.agent_enabled
+            if not registered or not enabled or not grant_id:
+                return
+            try:
+                renewed = self.control.renew(grant_id, self._session_binding(session), AGENT_GRANT_TTL_SECONDS)
+            except BridgeError as exc:
+                with self.session_lock:
+                    if session.agent_enabled and session.control_grant_id == grant_id:
+                        session.agent_renew_last_error = str(exc)
+                self._schedule_agent_renewal(session, AGENT_GRANT_RETRY_SECONDS)
+                return
+            with self.session_lock:
+                if not session.agent_enabled or session.control_grant_id != grant_id:
+                    return
+                session.control_grant_expires_at = renewed.get("expires_at")
+                session.agent_renew_last_error = None
+            self._schedule_agent_renewal(session)
+
+        timer = threading.Timer(delay_seconds, renew)
+        timer.daemon = True
+        session.agent_renew_timer = timer
+        timer.start()
+
+    def _apply_agent_grant(self, session: LiveSession, grant: dict[str, Any]) -> None:
+        session.agent_enabled = True
+        session.control_grant_id = grant.get("grant_id")
+        session.control_grant_expires_at = grant.get("expires_at", grant.get("exp"))
+        session.agent_renew_last_error = None
+        self._schedule_agent_renewal(session)
+
+    def _revoke_agent_grant(self, session: LiveSession) -> None:
+        self._stop_agent_renewal(session)
+        grant_id = session.control_grant_id
+        session.agent_enabled = False
+        session.control_grant_id = None
+        session.control_grant_expires_at = None
+        if grant_id and self.control.enabled:
+            try:
+                self.control.revoke(grant_id)
+            except BridgeError:
+                pass
 
     @staticmethod
     def _host_key_name(host: str, port: int) -> str:
@@ -860,14 +935,15 @@ class BridgeState:
             fingerprint=fingerprint, workdir=request["workdir"], backend=backend,
         )
         if self.control.enabled:
-            binding = {"host": session.host, "port": session.port, "username": session.username, "fingerprint": session.fingerprint}
-            auth = self.control.authorize(binding)
+            auth = self.control.authorize(self._session_binding(session))
             session.agent_enabled = bool(auth.get("authorized"))
             grant = auth.get("grant") or {}
             session.control_grant_id = grant.get("grant_id") if isinstance(grant, dict) else None
+            session.control_grant_expires_at = grant.get("exp") if isinstance(grant, dict) else None
         with self.session_lock:
             self._cleanup_disconnected_sessions()
             self.sessions[token] = session
+        self._schedule_agent_renewal(session)
         return token, session
 
     def session(self, token: str) -> LiveSession:
@@ -883,16 +959,23 @@ class BridgeState:
             raise BridgeError("agent enabled must be a boolean")
         session = self.session(token)
         if self.control.enabled:
-            binding = {"host": session.host, "port": session.port, "username": session.username, "fingerprint": session.fingerprint}
             if enabled:
-                grant = self.control.grant(binding, ["status:read", "jobs:read", "jobs:execute", "jobs:cancel"], 86400)
-                session.control_grant_id = grant.get("grant_id")
-            elif session.control_grant_id:
-                try:
-                    self.control.revoke(session.control_grant_id)
-                finally:
-                    session.control_grant_id = None
-            session.agent_enabled = enabled
+                scopes = ["status:read", "jobs:read", "jobs:execute", "jobs:cancel"]
+                existing = self.control.authorize(self._session_binding(session))
+                grant = existing.get("grant") if existing.get("authorized") else None
+                if not isinstance(grant, dict) or not all(scope in grant.get("scopes", []) for scope in scopes):
+                    grant = None
+                if grant is None and session.control_grant_id:
+                    try:
+                        renewed = self.control.renew(session.control_grant_id, self._session_binding(session), AGENT_GRANT_TTL_SECONDS)
+                        grant = renewed if all(scope in renewed.get("scopes", []) for scope in scopes) else None
+                    except BridgeError:
+                        grant = None
+                if grant is None:
+                    grant = self.control.grant(self._session_binding(session), scopes, AGENT_GRANT_TTL_SECONDS)
+                self._apply_agent_grant(session, grant)
+            else:
+                self._revoke_agent_grant(session)
             return session
         with self.session_lock:
             session.agent_enabled = enabled
@@ -905,16 +988,23 @@ class BridgeState:
             if self.control.enabled:
                 enabled = []
                 for token, session in self.sessions.items():
-                    binding = {"host": session.host, "port": session.port, "username": session.username, "fingerprint": session.fingerprint}
                     try:
-                        auth = self.control.authorize(binding)
+                        auth = self.control.authorize(self._session_binding(session))
                         authorized = auth.get("authorized", False)
                     except BridgeError:
-                        auth = {}
-                        authorized = False
-                    session.agent_enabled = bool(authorized)
+                        continue
                     grant = auth.get("grant") if authorized else None
-                    session.control_grant_id = grant.get("grant_id") if isinstance(grant, dict) else session.control_grant_id
+                    if not authorized and session.agent_enabled and session.control_grant_id:
+                        try:
+                            grant = self.control.renew(session.control_grant_id, self._session_binding(session), AGENT_GRANT_TTL_SECONDS)
+                            authorized = True
+                        except BridgeError:
+                            self._stop_agent_renewal(session)
+                            session.agent_enabled = False
+                            session.control_grant_id = None
+                            session.control_grant_expires_at = None
+                    if authorized and isinstance(grant, dict):
+                        self._apply_agent_grant(session, grant)
                     if authorized:
                         enabled.append((token, session))
             if not enabled:
@@ -927,6 +1017,7 @@ class BridgeState:
             session = self.sessions.pop(token, None)
         if session is None:
             raise KeyError("unknown or disconnected session")
+        self._revoke_agent_grant(session)
         self._close_client(session)
 
     def close_all_sessions(self) -> None:
@@ -934,6 +1025,7 @@ class BridgeState:
             sessions = list(self.sessions.values())
             self.sessions.clear()
         for session in sessions:
+            self._revoke_agent_grant(session)
             self._close_client(session)
 
 

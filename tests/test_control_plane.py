@@ -86,6 +86,21 @@ class GrantStoreTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             self.store.revoke("missing-grant")
 
+    def test_renewal_extends_expired_grant_but_never_revives_revocation(self) -> None:
+        with mock.patch.object(control_plane.time, "time", return_value=100):
+            original = self.store.grant(binding(), ["status:read"], 60)
+        with mock.patch.object(control_plane.time, "time", return_value=1000):
+            renewed = self.store.renew(original["grant_id"], binding(), 600)
+        self.assertEqual(renewed["grant_id"], original["grant_id"])
+        self.assertEqual(renewed["expires_at"], 1600)
+        with mock.patch.object(control_plane.time, "time", return_value=1001):
+            with self.assertRaises(control_plane.ControlError):
+                self.store.verify(original["token"], binding(), "status:read")
+            self.assertEqual(self.store.verify(renewed["token"], binding(), "status:read")["jti"], original["grant_id"])
+        self.store.revoke(original["grant_id"])
+        with self.assertRaisesRegex(control_plane.ControlError, "revoked"):
+            self.store.renew(original["grant_id"], binding(), 600)
+
     def test_state_and_signing_key_survive_reload(self) -> None:
         result = self.store.grant(binding(), ["files:read"], 60)
         original_key = self.key_path.read_bytes()
@@ -174,6 +189,13 @@ class ControlServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(authorized["authorized"])
         self.assertEqual(authorized["grant"]["grant_id"], granted["grant_id"])
+
+        status, renewed = self.post("/api/v1/grants/renew", {
+            "grant_id": granted["grant_id"], "binding": binding(), "ttl_seconds": 600,
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(renewed["grant_id"], granted["grant_id"])
+        self.assertGreaterEqual(renewed["expires_at"], granted["expires_at"])
 
         status, revoked = self.post("/api/v1/revoke", {"grant_id": granted["grant_id"]})
         self.assertEqual(status, 200)

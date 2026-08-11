@@ -55,7 +55,7 @@ Open `http://127.0.0.1:8877/` after all services report running.
 
 ## Use scoped Agent access
 
-Require the user to enable local Agent access for the active SSH session in the browser. Control grants are bound to host, port, username, and confirmed SSH fingerprint, expire within 24 hours, and are checked on every Agent operation.
+Require the user to enable local Agent access for the active SSH session in the browser. Control grants are bound to host, port, username, and confirmed SSH fingerprint and are checked on every Agent operation. Each lease lasts at most 24 hours, but Session renews it every 12 hours without a cumulative lifetime limit while the SSH session remains alive and the user keeps Agent access enabled. A temporary Control outage retries renewal every minute. Disabling Agent access, explicitly disconnecting, losing the SSH transport, or stopping Session ends renewal and revokes the current grant when Control is reachable.
 
 - Use `status:read` for session discovery and host status.
 - Use `jobs:read` for terminals, job status, and event streams.

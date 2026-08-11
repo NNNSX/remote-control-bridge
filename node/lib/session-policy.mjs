@@ -1,6 +1,9 @@
 export const MAX_TERMINALS = 4;
 export const SSH_KEEPALIVE_INTERVAL_MS = 30 * 1000;
 export const SSH_KEEPALIVE_COUNT_MAX = 10;
+export const AGENT_GRANT_TTL_SECONDS = 24 * 60 * 60;
+export const AGENT_GRANT_RENEW_INTERVAL_MS = 12 * 60 * 60 * 1000;
+export const AGENT_GRANT_RETRY_INTERVAL_MS = 60 * 1000;
 
 export function sshKeepaliveOptions() {
   return {
@@ -16,6 +19,46 @@ export function sessionConnectionPolicy() {
     keepalive_interval_seconds: SSH_KEEPALIVE_INTERVAL_MS / 1000,
     keepalive_failure_threshold: SSH_KEEPALIVE_COUNT_MAX,
   };
+}
+
+export function stopAgentGrantRenewal(session, clearTimer = globalThis.clearTimeout) {
+  if (session.agentRenewTimer) clearTimer(session.agentRenewTimer);
+  session.agentRenewTimer = null;
+}
+
+export function scheduleAgentGrantRenewal(session, renewGrant, options = {}) {
+  const setTimer = options.setTimer || globalThis.setTimeout;
+  const clearTimer = options.clearTimer || globalThis.clearTimeout;
+  const intervalMs = options.intervalMs || AGENT_GRANT_RENEW_INTERVAL_MS;
+  const retryMs = options.retryMs || AGENT_GRANT_RETRY_INTERVAL_MS;
+  const firstDelayMs = options.firstDelayMs || intervalMs;
+  stopAgentGrantRenewal(session, clearTimer);
+
+  const schedule = (delayMs) => {
+    if (!session.agentEnabled || !session.controlGrantId) return;
+    const grantId = session.controlGrantId;
+    const timer = setTimer(async () => {
+      if (session.agentRenewTimer === timer) session.agentRenewTimer = null;
+      if (!session.agentEnabled || session.controlGrantId !== grantId) return;
+      try {
+        const renewed = await renewGrant(grantId);
+        if (!session.agentEnabled || session.controlGrantId !== grantId) return;
+        if (!renewed || renewed.grant_id !== grantId) throw new Error("control renewed an unexpected Agent grant");
+        session.controlGrantExpiresAt = renewed.expires_at ?? null;
+        session.agentRenewLastError = null;
+        schedule(intervalMs);
+      } catch (error) {
+        if (!session.agentEnabled || session.controlGrantId !== grantId) return;
+        session.agentRenewLastError = error instanceof Error ? error.message : "Agent grant renewal failed";
+        schedule(retryMs);
+      }
+    }, delayMs);
+    session.agentRenewTimer = timer;
+    timer.unref?.();
+  };
+
+  schedule(firstDelayMs);
+  return session.agentRenewTimer;
 }
 
 export function createTerminal(session, idFactory) {

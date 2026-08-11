@@ -287,6 +287,61 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(client.revoke("grant-1"), {"revoked": True})
         post.assert_called_once_with("/api/v1/revoke", {"grant_id": "grant-1"})
 
+    def test_control_client_renew_posts_bound_lease(self) -> None:
+        with tempfile.NamedTemporaryFile(delete=False) as stream:
+            stream.write(b"0" * 32)
+            key_path = Path(stream.name)
+        self.addCleanup(key_path.unlink, missing_ok=True)
+        client = bridge.ControlClient("http://127.0.0.1:8878", key_path)
+        expected = {"grant_id": "grant-1", "expires_at": 123456}
+        with mock.patch.object(client, "_post", return_value=expected) as post:
+            self.assertEqual(client.renew("grant-1", {"host": "host"}, 600), expected)
+        post.assert_called_once_with("/api/v1/grants/renew", {"grant_id": "grant-1", "binding": {"host": "host"}, "ttl_seconds": 600})
+
+    def test_agent_grant_renewal_retries_and_stops_with_session(self) -> None:
+        state = bridge.BridgeState(self.config)
+        state.control = mock.MagicMock()
+        state.control.enabled = True
+        session = bridge.LiveSession(mock.MagicMock(), "192.0.2.10", 22, "remote-user", None, fingerprint="SHA256:test")
+        session.agent_enabled = True
+        session.control_grant_id = "grant-1"
+        state.sessions["temporary-session-token"] = session
+        timers = []
+
+        class FakeTimer:
+            def __init__(self, delay, callback):
+                self.delay = delay
+                self.callback = callback
+                self.daemon = False
+                self.started = False
+                self.cancelled = False
+
+            def start(self):
+                self.started = True
+
+            def cancel(self):
+                self.cancelled = True
+
+        def create_timer(delay, callback):
+            timer = FakeTimer(delay, callback)
+            timers.append(timer)
+            return timer
+
+        state.control.renew.side_effect = [bridge.BridgeError("control temporarily unavailable"), {"grant_id": "grant-1", "expires_at": 123456}]
+        with mock.patch.object(bridge.threading, "Timer", side_effect=create_timer):
+            state._schedule_agent_renewal(session)
+            self.assertEqual(timers[0].delay, bridge.AGENT_GRANT_RENEW_INTERVAL_SECONDS)
+            timers[0].callback()
+            self.assertEqual(session.agent_renew_last_error, "control temporarily unavailable")
+            self.assertEqual(timers[1].delay, bridge.AGENT_GRANT_RETRY_SECONDS)
+            timers[1].callback()
+            self.assertEqual(session.control_grant_expires_at, 123456)
+            self.assertIsNone(session.agent_renew_last_error)
+            self.assertEqual(timers[2].delay, bridge.AGENT_GRANT_RENEW_INTERVAL_SECONDS)
+            state.close_session("temporary-session-token")
+        self.assertTrue(timers[2].cancelled)
+        state.control.revoke.assert_called_once_with("grant-1")
+
     def test_control_client_rejects_non_loopback_url_and_missing_key(self) -> None:
         with self.assertRaises(bridge.BridgeError):
             bridge.ControlClient("http://192.0.2.10:8878", Path("missing-key"))

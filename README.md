@@ -56,6 +56,8 @@ Remote Control Bridge 是一个面向 Codex 和本地 Agent 的远程 SSH 工作
 
 本地 Agent 只有在用户明确授权后才能发现当前 SSH 会话。授权按主机、端口、用户名和 SSH 指纹绑定，并带有作用域和有效期。
 
+只要 SSH 会话仍然存活且用户没有关闭 Agent 权限，Session 会自动滚动续期授权，不设置累计时长上限。用户关闭 Agent、主动断开连接、SSH 失联或 Session 退出时停止续期，并撤销当前授权。
+
 Agent 可以：
 
 - 读取会话和主机状态

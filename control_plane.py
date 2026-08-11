@@ -85,13 +85,35 @@ class GrantStore:
             raise ControlError("ttl_seconds must be between 60 and 86400")
         now = int(time.time())
         grant_id = secrets.token_urlsafe(18)
-        payload = {"jti": grant_id, "binding": binding, "scopes": sorted(set(scopes)), "exp": now + ttl_seconds}
+        grant = {"binding": binding, "scopes": sorted(set(scopes)), "exp": now + ttl_seconds, "revoked": False}
+        with self.lock:
+            self.grants[grant_id] = grant
+            self._save_state()
+        return self._grant_result(grant_id, grant)
+
+    def _grant_result(self, grant_id: str, grant: dict[str, Any]) -> dict[str, Any]:
+        payload = {"jti": grant_id, "binding": grant["binding"], "scopes": grant["scopes"], "exp": grant["exp"]}
         encoded = _b64(json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
         signature = _b64(hmac.new(self.key, encoded.encode("ascii"), hashlib.sha256).digest())
-        with self.lock:
-            self.grants[grant_id] = {"binding": binding, "scopes": payload["scopes"], "exp": payload["exp"], "revoked": False}
-            self._save_state()
         return {"grant_id": grant_id, "token": encoded + "." + signature, "expires_at": payload["exp"], "scopes": payload["scopes"]}
+
+    def renew(self, grant_id: Any, binding: Any, ttl_seconds: Any) -> dict[str, Any]:
+        if not isinstance(grant_id, str):
+            raise ControlError("grant_id is required")
+        checked_binding = self._binding(binding)
+        if not isinstance(ttl_seconds, int) or not 60 <= ttl_seconds <= 86400:
+            raise ControlError("ttl_seconds must be between 60 and 86400")
+        with self.lock:
+            grant = self.grants.get(grant_id)
+            if grant is None:
+                raise KeyError("unknown grant")
+            if grant.get("revoked"):
+                raise ControlError("grant is revoked")
+            if grant.get("binding") != checked_binding:
+                raise ControlError("grant is bound to another session")
+            grant["exp"] = int(time.time()) + ttl_seconds
+            self._save_state()
+            return self._grant_result(grant_id, grant)
 
     def verify(self, token: Any, binding: Any, scope: str | None = None) -> dict[str, Any]:
         if not isinstance(token, str) or token.count(".") != 1:
@@ -104,7 +126,7 @@ class GrantStore:
         checked_binding = self._binding(binding)
         with self.lock:
             grant = self.grants.get(payload.get("jti"))
-        if not grant or grant.get("revoked") or int(payload.get("exp", 0)) <= int(time.time()) or grant["binding"] != checked_binding:
+        if not grant or grant.get("revoked") or int(payload.get("exp", 0)) <= int(time.time()) or int(payload.get("exp", 0)) != int(grant.get("exp", 0)) or grant["binding"] != checked_binding:
             raise ControlError("capability is expired, revoked, or bound to another session")
         if scope is not None and scope not in grant["scopes"]:
             raise ControlError("capability does not include the requested scope")
@@ -193,6 +215,8 @@ class ControlHandler(BaseHTTPRequestHandler):
             data = self._body()
             if self.path == "/api/v1/grants":
                 self._json(self.server.store.grant(data.get("binding"), data.get("scopes"), data.get("ttl_seconds", 1800)), HTTPStatus.CREATED)
+            elif self.path == "/api/v1/grants/renew":
+                self._json(self.server.store.renew(data.get("grant_id"), data.get("binding"), data.get("ttl_seconds", 86400)))
             elif self.path == "/api/v1/authorize":
                 result = self.server.store.authorize_binding(data.get("binding"))
                 self._json({"authorized": result is not None, "grant": result})

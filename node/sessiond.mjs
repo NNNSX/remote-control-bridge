@@ -15,7 +15,7 @@ import { createControlClient } from "./lib/control-client.mjs";
 import { mediaTypeForPath } from "./lib/file-media.mjs";
 import { decodeTextPreview, isKnownBinaryPath, MAX_IMAGE_PREVIEW_BYTES, MAX_TEXT_PREVIEW_BYTES } from "./lib/file-preview.mjs";
 import { RemoteTaskService } from "./lib/remote-task-service.mjs";
-import { createTerminal, ensureTerminal, sessionConnectionPolicy, sshKeepaliveOptions } from "./lib/session-policy.mjs";
+import { AGENT_GRANT_TTL_SECONDS, createTerminal, ensureTerminal, scheduleAgentGrantRenewal, sessionConnectionPolicy, sshKeepaliveOptions, stopAgentGrantRenewal } from "./lib/session-policy.mjs";
 import { createSftpTaskRemote } from "./lib/sftp-task-remote.mjs";
 import { SftpTusStore } from "./lib/sftp-tus-store.mjs";
 import { TaskIndex, taskOwnerKey } from "./lib/task-index.mjs";
@@ -147,19 +147,40 @@ function requireKeyCache(file) {
 }
 
 function sessionBinding(session) { return { host: session.host, port: session.port, username: session.username, fingerprint: session.fingerprint }; }
-function closeSession(session, endClient = true) { if (session.taskReconcileTimer) clearTimeout(session.taskReconcileTimer); sessions.delete(session.id); for (const job of session.jobs.values()) { job.cancel = true; job.stream?.close(); } if (endClient) { try { session.client.end(); } catch {} } }
+function startAgentGrantRenewal(session) {
+  if (!session.agentEnabled || !session.controlGrantId) return;
+  scheduleAgentGrantRenewal(session, (grantId) => control.renew(grantId, sessionBinding(session), AGENT_GRANT_TTL_SECONDS));
+}
+function applyAgentGrant(session, grant, restartRenewal = true) {
+  session.agentEnabled = true;
+  session.controlGrantId = grant.grant_id;
+  session.controlGrantExpiresAt = grant.expires_at ?? grant.exp ?? null;
+  if (restartRenewal || !session.agentRenewTimer) startAgentGrantRenewal(session);
+  return grant;
+}
+async function revokeAgentGrant(session) {
+  stopAgentGrantRenewal(session);
+  const grantId = session.controlGrantId;
+  session.agentEnabled = false;
+  session.controlGrantId = null;
+  session.controlGrantExpiresAt = null;
+  if (grantId) { try { await control.revoke(grantId); } catch {} }
+}
+async function closeSession(session, endClient = true) { if (session.taskReconcileTimer) clearTimeout(session.taskReconcileTimer); sessions.delete(session.id); for (const job of session.jobs.values()) { job.cancel = true; job.stream?.close(); } if (endClient) { try { session.client.end(); } catch {} } await revokeAgentGrant(session); }
 function sessionInfo(session) { return { session: session.id, host: session.host, port: session.port, username: session.username, fingerprint: session.fingerprint, ...sessionConnectionPolicy() }; }
 function getSession(idValue) { const session = sessions.get(idValue); if (!session) throw new Error("unknown or disconnected session"); return session; }
 async function agentSession(scope) {
   for (const session of [...sessions.values()].reverse()) {
     let authorization;
     try { authorization = await control.authorize(sessionBinding(session)); }
-    catch { session.agentEnabled = false; continue; }
-    const grant = authorization.grant;
+    catch { continue; }
+    let grant = authorization.grant;
+    if (!authorization.authorized && session.agentEnabled && session.controlGrantId) {
+      try { grant = await control.renew(session.controlGrantId, sessionBinding(session), AGENT_GRANT_TTL_SECONDS); authorization = { authorized: true, grant }; }
+      catch { stopAgentGrantRenewal(session); session.agentEnabled = false; session.controlGrantId = null; session.controlGrantExpiresAt = null; continue; }
+    }
     const allowed = Boolean(authorization.authorized && grant?.scopes?.includes(scope));
-    session.agentEnabled = allowed;
-    session.controlGrantId = allowed ? grant.grant_id : null;
-    if (allowed) return session;
+    if (allowed) { applyAgentGrant(session, grant, false); return session; }
   }
   const error = new Error(`no Agent-authorized SSH session includes ${scope}`);
   error.status_code = 403;
@@ -497,14 +518,16 @@ const server = http.createServer(async (request, response) => {
       const data = await readBody(request);
       const connection = await connectSsh(data);
       try {
-        const session = { id: id("session"), client: connection.client, host: data.host, port: Number(data.port || 22), username: data.username, fingerprint: connection.fingerprint, jobs: new Map(), terminals: new Map([["term-1", { terminal_id: "term-1", index: 1, busy: false, current_job_id: null, jobs: [] }]]), agentEnabled: false, controlGrantId: null };
+        const session = { id: id("session"), client: connection.client, host: data.host, port: Number(data.port || 22), username: data.username, fingerprint: connection.fingerprint, jobs: new Map(), terminals: new Map([["term-1", { terminal_id: "term-1", index: 1, busy: false, current_job_id: null, jobs: [] }]]), agentEnabled: false, controlGrantId: null, controlGrantExpiresAt: null, agentRenewTimer: null };
         const authorization = await control.authorize(sessionBinding(session));
         session.agentEnabled = Boolean(authorization.authorized && agentGrantScopes.every((scope) => authorization.grant?.scopes?.includes(scope)));
         session.controlGrantId = session.agentEnabled ? authorization.grant.grant_id : null;
+        session.controlGrantExpiresAt = session.agentEnabled ? authorization.grant.exp : null;
         sessions.set(session.id, session);
+        startAgentGrantRenewal(session);
         scheduleTaskReconcile(session);
         session.client.once("close", () => {
-          if (sessions.has(session.id)) closeSession(session, false);
+          if (sessions.has(session.id)) void closeSession(session, false);
         });
         return json(response, 201, { ...sessionInfo(session), status: await collectStatus(session) });
       } catch (error) {
@@ -535,14 +558,12 @@ const server = http.createServer(async (request, response) => {
         if (typeof data.enabled !== "boolean") throw new Error("agent enabled must be a boolean");
         if (data.enabled) {
           const existing = await control.authorize(sessionBinding(session));
-          const grant = existing.authorized && agentGrantScopes.every((scope) => existing.grant?.scopes?.includes(scope)) ? existing.grant : await control.grant(sessionBinding(session), agentGrantScopes);
-          session.agentEnabled = true;
-          session.controlGrantId = grant.grant_id;
+          let grant = existing.authorized && agentGrantScopes.every((scope) => existing.grant?.scopes?.includes(scope)) ? existing.grant : null;
+          if (!grant && session.controlGrantId) { try { grant = await control.renew(session.controlGrantId, sessionBinding(session), AGENT_GRANT_TTL_SECONDS); } catch {} }
+          if (!grant || !agentGrantScopes.every((scope) => grant.scopes?.includes(scope))) grant = await control.grant(sessionBinding(session), agentGrantScopes, AGENT_GRANT_TTL_SECONDS);
+          applyAgentGrant(session, grant);
         } else {
-          const existing = session.controlGrantId ? { grant_id: session.controlGrantId } : (await control.authorize(sessionBinding(session))).grant;
-          if (existing?.grant_id) await control.revoke(existing.grant_id);
-          session.agentEnabled = false;
-          session.controlGrantId = null;
+          await revokeAgentGrant(session);
         }
         return json(response, 200, { enabled: session.agentEnabled, session: session.id });
       }
@@ -555,7 +576,7 @@ const server = http.createServer(async (request, response) => {
       if (request.method === "POST" && suffix === "files/rename") { const data = await readBody(request); const from = safeRelative(data.from); const to = safeRelative(data.to); const { sftp } = await sftpCall(session, "rename", from, to); closeSftp(sftp); return json(response, 200, { from, to, renamed: true }); }
       if (request.method === "DELETE" && suffix === "files") return json(response, 200, await fileDelete(session, url.searchParams.get("path") || ""));
       if (request.method === "DELETE" && suffix.startsWith("jobs/")) { const job = session.jobs.get(suffix.split("/")[1]); if (!job) throw new Error("unknown job"); job.cancel = true; job.stream?.close(); return json(response, 202, { cancelled: true, job_id: job.id }); }
-      if (request.method === "DELETE" && !suffix) { closeSession(session); return json(response, 200, { closed: true }); }
+      if (request.method === "DELETE" && !suffix) { await closeSession(session); return json(response, 200, { closed: true }); }
     }
     return json(response, 404, { error: "not found" });
   } catch (error) {
@@ -566,9 +587,12 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.listen(port, "127.0.0.1", () => process.stdout.write(`${JSON.stringify({ ok: true, mode: "ssh-session-daemon", url: `http://127.0.0.1:${server.address().port}` })}\n`));
-function shutdown() {
-  for (const session of [...sessions.values()]) closeSession(session);
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  await Promise.all([...sessions.values()].map((session) => closeSession(session)));
   server.close(() => { try { localTaskIndex?.close(); } catch {} process.exit(0); });
 }
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
+process.on("SIGTERM", () => void shutdown());
+process.on("SIGINT", () => void shutdown());

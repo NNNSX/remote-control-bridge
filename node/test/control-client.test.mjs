@@ -34,7 +34,14 @@ test("control grants are bound, scoped, verified, persisted, and revoked", async
   await assert.rejects(() => client.verify(created.token, binding, "jobs:execute"), /requested scope/);
   await assert.rejects(() => client.verify(created.token, { ...binding, host: "other.example" }, "status:read"), /another session/);
 
+  const renewed = await client.renew(created.grant_id, binding, 600);
+  assert.equal(renewed.grant_id, created.grant_id);
+  assert.ok(renewed.expires_at > created.expires_at);
+  await assert.rejects(() => client.verify(created.token, binding, "status:read"), /expired, revoked, or bound/);
+  assert.equal((await client.verify(renewed.token, binding, "status:read")).authorized, true);
+
   await client.revoke(created.grant_id);
   assert.equal((await client.authorize(binding)).authorized, false);
-  await assert.rejects(() => client.verify(created.token, binding, "status:read"), /expired, revoked, or bound/);
+  await assert.rejects(() => client.verify(renewed.token, binding, "status:read"), /expired, revoked, or bound/);
+  await assert.rejects(() => client.renew(created.grant_id, binding), /revoked/);
 });

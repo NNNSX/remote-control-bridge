@@ -31,6 +31,7 @@ export class ControlClient {
   }
 
   grant(binding, scopes, ttlSeconds = 86400) { return this.post("/api/v1/grants", { binding, scopes, ttl_seconds: ttlSeconds }); }
+  renew(grantId, binding, ttlSeconds = 86400) { return this.post("/api/v1/grants/renew", { grant_id: grantId, binding, ttl_seconds: ttlSeconds }); }
   authorize(binding) { return this.post("/api/v1/authorize", { binding }); }
   verify(token, binding, scope) { return this.post("/api/v1/verify", { token, binding, scope }); }
   revoke(grantId) { return this.post("/api/v1/revoke", { grant_id: grantId }); }

@@ -16,6 +16,12 @@ function listen(server) { return new Promise((resolve, reject) => { server.once(
 function close(server) { return new Promise((resolve) => server.close(resolve)); }
 async function freePort() { const probe = http.createServer(); const port = await listen(probe); await close(probe); return port; }
 function launch(script, args) { return spawn(process.execPath, [path.join(nodeDir, script), ...args], { cwd: nodeDir, stdio: ["ignore", "pipe", "pipe"], windowsHide: true }); }
+async function stopChild(child) {
+  if (child.exitCode !== null) return;
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  child.kill();
+  await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 5000))]);
+}
 
 async function waitFor(check, children, timeoutMs = 7000) {
   const deadline = Date.now() + timeoutMs;
@@ -90,7 +96,7 @@ test("Agent access requires a fingerprint-bound Control grant and revokes immedi
   const [controlPort, sessionPort, bridgePort] = await Promise.all([freePort(), freePort(), freePort()]);
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "rcb-agent-"));
   const children = [];
-  context.after(async () => { for (const child of children) if (child.exitCode === null) child.kill(); await close(ssh); await fs.rm(dataDir, { recursive: true, force: true }); });
+  context.after(async () => { for (const child of [...children].reverse()) await stopChild(child); await close(ssh); await fs.rm(dataDir, { recursive: true, force: true }); });
 
   children.push(launch("bridge-control.mjs", ["--port", String(controlPort), "--data-dir", dataDir]));
   await waitFor(async () => (await fetch(`http://127.0.0.1:${controlPort}/api/v1/health`)).ok, children);
@@ -192,6 +198,15 @@ test("Agent access requires a fingerprint-bound Control grant and revokes immedi
   response = await fetch(`${api}/sessions/${sessionId}/agent`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: false }) });
   assert.equal(response.status, 200);
   assert.equal((await fetch(`${api}/agent/session`)).status, 403);
+  grants = JSON.parse(await fs.readFile(path.join(dataDir, "control_grants.json"), "utf8"));
+  assert.equal(Object.values(grants).every((grant) => grant.revoked), true);
+
+  response = await fetch(`${api}/sessions/${sessionId}/agent`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: true }) });
+  assert.equal(response.status, 200);
+  grants = JSON.parse(await fs.readFile(path.join(dataDir, "control_grants.json"), "utf8"));
+  assert.equal(Object.values(grants).some((grant) => !grant.revoked), true);
+  response = await fetch(`${api}/sessions/${sessionId}`, { method: "DELETE" });
+  assert.equal(response.status, 200);
   grants = JSON.parse(await fs.readFile(path.join(dataDir, "control_grants.json"), "utf8"));
   assert.equal(Object.values(grants).every((grant) => grant.revoked), true);
 });
