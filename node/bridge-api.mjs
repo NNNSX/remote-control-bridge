@@ -29,10 +29,10 @@ const server = http.createServer(async (request, response) => {
     if (url.pathname.startsWith("/api/v1/sessions") || url.pathname.startsWith("/api/v1/agent") || url.pathname.startsWith("/api/v1/transfers") || url.pathname === "/api/v1/host-keys/trust") {
       const hasBody = !["GET", "HEAD"].includes(request.method) && (Number(request.headers["content-length"] || 0) > 0 || Boolean(request.headers["transfer-encoding"]));
       const forwardedHeaders = { "x-session-key": sessionKey.toString("hex") };
-      for (const name of ["content-type", "content-length", "tus-resumable", "upload-length", "upload-offset", "upload-metadata", "upload-defer-length", "upload-concat", "x-rcb-session"]) if (request.headers[name]) forwardedHeaders[name] = request.headers[name];
+      for (const name of ["content-type", "content-length", "cookie", "tus-resumable", "upload-length", "upload-offset", "upload-metadata", "upload-defer-length", "upload-concat", "x-rcb-session"]) if (request.headers[name]) forwardedHeaders[name] = request.headers[name];
       const upstream = await fetch(`http://127.0.0.1:${sessionPort}${internalPath(url.pathname)}${url.search}`, { method: request.method, headers: forwardedHeaders, body: hasBody ? request : undefined, duplex: "half" });
       const responseHeaders = { "content-type": upstream.headers.get("content-type") || "application/json", "cache-control": upstream.headers.get("content-type")?.startsWith("text/event-stream") ? "no-cache, no-store" : "no-store", "x-content-type-options": "nosniff" };
-      for (const name of ["content-length", "content-disposition", "location", "tus-resumable", "tus-version", "tus-extension", "tus-max-size", "upload-offset", "upload-length", "upload-metadata", "upload-expires"]) { const value = upstream.headers.get(name); if (value) responseHeaders[name] = value.replace?.(`http://127.0.0.1:${sessionPort}/internal/v1/transfers`, "/api/v1/transfers") || value; }
+      for (const name of ["content-length", "content-disposition", "location", "set-cookie", "tus-resumable", "tus-version", "tus-extension", "tus-max-size", "upload-offset", "upload-length", "upload-metadata", "upload-expires"]) { const value = upstream.headers.get(name); if (value) responseHeaders[name] = value.replace?.(`http://127.0.0.1:${sessionPort}/internal/v1/transfers`, "/api/v1/transfers") || value; }
       response.writeHead(upstream.status, responseHeaders);
       if (upstream.body) {
         for await (const chunk of upstream.body) response.write(chunk);

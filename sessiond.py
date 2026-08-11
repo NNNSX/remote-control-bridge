@@ -42,13 +42,15 @@ class SessionDaemonHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         return
 
-    def _json(self, payload: Any, status: int = 200) -> None:
+    def _json(self, payload: Any, status: int = 200, extra_headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store, max-age=0")
+            for name, value in (extra_headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
@@ -86,6 +88,22 @@ class SessionDaemonHandler(BaseHTTPRequestHandler):
                     raise SessionDaemonError("health does not accept query parameters")
                 self._json({"ok": True, "mode": "ssh-session-daemon", "sessions": len(self.server.state.sessions)})
                 return
+            if request.path == "/internal/v1/sessions/recover":
+                if query:
+                    raise SessionDaemonError("session recovery does not accept query parameters")
+                try:
+                    token, session, recovery_token = self.server.state.recover_session(self.headers.get("Cookie"))
+                except KeyError:
+                    self._json({"error": "no recoverable SSH session"}, HTTPStatus.NOT_FOUND, {"Set-Cookie": bridge.clear_session_recovery_cookie()})
+                    return
+                self._json({
+                    "session": token, "host": session.host, "port": session.port,
+                    "username": session.username, "fingerprint": session.fingerprint,
+                    "agent_enabled": session.agent_enabled,
+                    **bridge.session_connection_policy(session.backend),
+                    "status": bridge.collect_session_status(self.server.state, token),
+                }, extra_headers={"Set-Cookie": bridge.session_recovery_cookie(recovery_token)})
+                return
             status_match = re.fullmatch(r"/internal/v1/sessions/([A-Za-z0-9_-]{20,80})/status", request.path)
             if status_match:
                 self._json(bridge.collect_session_status(self.server.state, status_match.group(1)))
@@ -117,7 +135,7 @@ class SessionDaemonHandler(BaseHTTPRequestHandler):
                 self._json({
                     "authorized": True, "session": token, "host": session.host,
                     "port": session.port, "username": session.username,
-                    **bridge.session_connection_policy(),
+                    **bridge.session_connection_policy(session.backend),
                 })
                 return
             if request.path == "/internal/v1/agent/terminals":
@@ -178,9 +196,9 @@ class SessionDaemonHandler(BaseHTTPRequestHandler):
                     "port": session.port,
                     "username": session.username,
                     "fingerprint": session.fingerprint,
-                    **bridge.session_connection_policy(),
+                    **bridge.session_connection_policy(session.backend),
                     "status": status_data,
-                }, HTTPStatus.CREATED)
+                }, HTTPStatus.CREATED, {"Set-Cookie": bridge.session_recovery_cookie(self.server.state.issue_session_recovery(session))})
                 return
             log_match = re.fullmatch(r"/internal/v1/sessions/([A-Za-z0-9_-]{20,80})/logs", path)
             if log_match:
@@ -238,8 +256,12 @@ class SessionDaemonHandler(BaseHTTPRequestHandler):
                 self._json(bridge.cancel_session_job(self.server.state, token, agent_job_match.group(1)), HTTPStatus.ACCEPTED)
                 return
             if session_match:
-                self.server.state.close_session(session_match.group(1))
-                self._json({"closed": True})
+                try:
+                    self.server.state.close_session(session_match.group(1))
+                    closed = True
+                except KeyError:
+                    closed = False
+                self._json({"closed": closed}, extra_headers={"Set-Cookie": bridge.clear_session_recovery_cookie()})
                 return
             self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         except bridge.ConflictError as exc:

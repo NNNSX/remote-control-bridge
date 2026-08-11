@@ -113,3 +113,26 @@ test("bridge proxies the tus lifecycle and rewrites the upload location", async 
   assert.equal(requests[3].body.toString(), "def");
   assert.equal(requests.every((request) => request.headers["x-session-key"] === Buffer.alloc(32, 9).toString("hex")), true);
 });
+
+test("bridge forwards browser recovery cookies in both directions", async (context) => {
+  const requests = [];
+  const upstream = http.createServer((request, response) => {
+    requests.push(request.headers);
+    response.writeHead(200, { "Content-Type": "application/json", "Set-Cookie": "rcb_session_recovery=refreshed; Path=/; HttpOnly; SameSite=Strict" });
+    response.end('{"session":"session-test"}');
+  });
+  const upstreamPort = await listen(upstream);
+  const portProbe = http.createServer();
+  const bridgePort = await listen(portProbe);
+  await close(portProbe);
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "rcb-bridge-cookie-"));
+  await fs.writeFile(path.join(dataDir, "sessiond.key"), Buffer.alloc(32, 4));
+  const child = spawn(process.execPath, [path.join(nodeDir, "bridge-api.mjs"), "--port", String(bridgePort), "--session-port", String(upstreamPort), "--data-dir", dataDir], { cwd: nodeDir, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  context.after(async () => { if (child.exitCode === null) child.kill(); await close(upstream); await fs.rm(dataDir, { recursive: true, force: true }); });
+  await waitForBridge(bridgePort, child);
+
+  const response = await fetch(`http://127.0.0.1:${bridgePort}/api/v1/sessions/recover`, { headers: { Cookie: "rcb_session_recovery=original" } });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("set-cookie"), "rcb_session_recovery=refreshed; Path=/; HttpOnly; SameSite=Strict");
+  assert.equal(requests.at(-1).cookie, "rcb_session_recovery=original");
+});

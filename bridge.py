@@ -55,6 +55,8 @@ ARTIFACT_KEYS = {"name", "url", "sha256", "destination", "max_bytes"}
 STATIC_FILES = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/app.css": "app.css"}
 SSH_KEEPALIVE_INTERVAL_SECONDS = 30
 SSH_KEEPALIVE_COUNT_MAX = 10
+SESSION_RECOVERY_COOKIE = "rcb_session_recovery"
+SESSION_RECOVERY_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 AGENT_GRANT_TTL_SECONDS = 24 * 60 * 60
 AGENT_GRANT_RENEW_INTERVAL_SECONDS = 12 * 60 * 60
 AGENT_GRANT_RETRY_SECONDS = 60
@@ -70,13 +72,31 @@ MAX_GLOBAL_ACTIVE_JOBS = 8
 MAX_JOB_EVENTS = 512
 
 
-def session_connection_policy() -> dict[str, Any]:
-    return {
+def session_connection_policy(backend: str = "paramiko") -> dict[str, Any]:
+    policy = {
         "expires_in_seconds": None,
         "idle_timeout_enabled": False,
         "keepalive_interval_seconds": SSH_KEEPALIVE_INTERVAL_SECONDS,
-        "keepalive_failure_threshold": SSH_KEEPALIVE_COUNT_MAX,
     }
+    if backend == "paramiko":
+        return {**policy, "keepalive_failure_threshold": None, "disconnect_detection": "transport"}
+    return {**policy, "keepalive_failure_threshold": SSH_KEEPALIVE_COUNT_MAX, "disconnect_detection": "keepalive_count"}
+
+
+def session_recovery_cookie(token: str) -> str:
+    return f"{SESSION_RECOVERY_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_RECOVERY_MAX_AGE_SECONDS}"
+
+
+def clear_session_recovery_cookie() -> str:
+    return f"{SESSION_RECOVERY_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+
+
+def session_recovery_token(cookie_header: str | None) -> str | None:
+    for part in (cookie_header or "").split(";"):
+        name, separator, value = part.strip().partition("=")
+        if separator and name == SESSION_RECOVERY_COOKIE:
+            return value
+    return None
 
 
 SENSITIVE_SEGMENTS = {".aws", ".git", ".gnupg", ".kube", ".ssh", "authorized_keys", "credentials", "credentials.json", "id_dsa", "id_ecdsa", "id_ed25519", "id_rsa", "known_hosts", "secrets", "secrets.json", ".netrc"}
@@ -219,21 +239,29 @@ class SessionDaemonClient:
     def enabled(self) -> bool:
         return bool(self.base_url and self.key)
 
-    def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
+    def request_with_headers(
+        self, method: str, path: str, payload: dict[str, Any] | None = None,
+        forwarded_headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, Any], dict[str, str]]:
         if not self.enabled or not path.startswith("/internal/v1/") or any(char in path for char in "\r\n"):
             raise BridgeError("SSH session daemon is unavailable")
         body = None if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        headers = {"Content-Type": "application/json", "X-Session-Key": self.key or ""}
+        if forwarded_headers and forwarded_headers.get("Cookie"):
+            headers["Cookie"] = forwarded_headers["Cookie"]
         request = urllib.request.Request(
             self.base_url + path, data=body, method=method,
-            headers={"Content-Type": "application/json", "X-Session-Key": self.key or ""},
+            headers=headers,
         )
         timeout = SESSION_OPEN_PROXY_TIMEOUT_SECONDS if method == "POST" and path == "/internal/v1/sessions" else 5
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 status = response.status
                 result = json.loads(response.read().decode("utf-8"))
+                response_headers = {name.lower(): value for name, value in response.headers.items()}
         except urllib.error.HTTPError as exc:
             status = exc.code
+            response_headers = {name.lower(): value for name, value in exc.headers.items()}
             try:
                 result = json.loads(exc.read().decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -242,6 +270,10 @@ class SessionDaemonClient:
             raise BridgeError("SSH session daemon is unavailable") from exc
         if not isinstance(result, dict):
             raise BridgeError("SSH session daemon returned an invalid response")
+        return status, result, response_headers
+
+    def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
+        status, result, _ = self.request_with_headers(method, path, payload)
         return status, result
 
     def revoke(self, grant_id: str) -> dict[str, Any]:
@@ -638,6 +670,8 @@ class LiveSession:
     control_grant_expires_at: int | None = None
     agent_renew_timer: threading.Timer | None = field(default=None, repr=False)
     agent_renew_last_error: str | None = None
+    recovery_token_hash: bytes | None = field(default=None, repr=False)
+    recovery_fingerprint: str | None = field(default=None, repr=False)
     terminals: dict[str, TerminalSlot] = field(default_factory=dict, repr=False)
     jobs: dict[str, CommandJob] = field(default_factory=dict, repr=False)
     terminal_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -953,6 +987,27 @@ class BridgeState:
             if session is None:
                 raise KeyError("unknown or disconnected session")
             return session
+
+    def issue_session_recovery(self, session: LiveSession) -> str:
+        token = secrets.token_urlsafe(32)
+        session.recovery_token_hash = hashlib.sha256(token.encode("ascii")).digest()
+        session.recovery_fingerprint = session.fingerprint
+        return token
+
+    def recover_session(self, cookie_header: str | None) -> tuple[str, LiveSession, str]:
+        recovery_token = session_recovery_token(cookie_header)
+        if recovery_token is None or re.fullmatch(r"[A-Za-z0-9_-]{40,80}", recovery_token) is None:
+            raise KeyError("no recoverable SSH session")
+        supplied = hashlib.sha256(recovery_token.encode("ascii")).digest()
+        with self.session_lock:
+            self._cleanup_disconnected_sessions()
+            for token, session in reversed(list(self.sessions.items())):
+                expected = session.recovery_token_hash
+                if expected is None or session.recovery_fingerprint != session.fingerprint:
+                    continue
+                if secrets.compare_digest(expected, supplied):
+                    return token, session, recovery_token
+        raise KeyError("no recoverable SSH session")
 
     def set_agent_enabled(self, token: str, enabled: bool) -> LiveSession:
         if not isinstance(enabled, bool):
@@ -1363,7 +1418,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         sys.stderr.write("bridge: " + format % args + "\n")
 
-    def _headers(self, status: int, content_type: str, length: int) -> None:
+    def _headers(self, status: int, content_type: str, length: int, extra_headers: dict[str, str] | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(length))
@@ -1373,11 +1428,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
 
-    def _json(self, payload: Any, status: int = 200) -> None:
+    def _json(self, payload: Any, status: int = 200, extra_headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
-        self._headers(status, "application/json; charset=utf-8", len(body))
+        self._headers(status, "application/json; charset=utf-8", len(body), extra_headers)
         self.wfile.write(body)
 
     def _job_events(self, job: CommandJob) -> None:
@@ -1429,8 +1486,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
 
     def _sessiond_json(self, method: str, path: str, payload: dict[str, Any] | None = None) -> None:
-        status, result = self.server.state.sessiond.request(method, path, payload)
-        self._json(result, status)
+        forwarded_headers = {}
+        if self.headers.get("Cookie"):
+            forwarded_headers["Cookie"] = self.headers["Cookie"]
+        status, result, response_headers = self.server.state.sessiond.request_with_headers(method, path, payload, forwarded_headers)
+        extra_headers = {"Set-Cookie": response_headers["set-cookie"]} if response_headers.get("set-cookie") else None
+        self._json(result, status, extra_headers)
 
     def _sessiond_events(self, path: str) -> None:
         self.send_response(HTTPStatus.OK)
@@ -1520,6 +1581,25 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         try:
             query = parse_qs(request.query, keep_blank_values=True, strict_parsing=True)
+            if request.path == "/api/v1/sessions/recover":
+                if query:
+                    raise BridgeError("session recovery does not accept query parameters")
+                if self.server.state.sessiond.enabled:
+                    self._sessiond_json("GET", "/internal/v1/sessions/recover")
+                    return
+                try:
+                    token, session, recovery_token = self.server.state.recover_session(self.headers.get("Cookie"))
+                except KeyError:
+                    self._json({"error": "no recoverable SSH session"}, HTTPStatus.NOT_FOUND, {"Set-Cookie": clear_session_recovery_cookie()})
+                    return
+                self._json({
+                    "session": token, "host": session.host, "port": session.port,
+                    "username": session.username, "fingerprint": session.fingerprint,
+                    "agent_enabled": session.agent_enabled,
+                    **session_connection_policy(session.backend),
+                    "status": collect_session_status(self.server.state, token),
+                }, extra_headers={"Set-Cookie": session_recovery_cookie(recovery_token)})
+                return
             session_status = re.fullmatch(r"/api/v1/sessions/([A-Za-z0-9_-]{20,80})/status", request.path)
             if session_status:
                 if query:
@@ -1561,11 +1641,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     raise BridgeError("agent session discovery does not accept query parameters")
                 if self.server.state.sessiond.enabled:
                     status, result = self.server.state.sessiond.request("GET", "/internal/v1/agent/session")
-                    result.pop("session", None)
                     self._json(result, status)
                     return
-                _, session = self.server.state.agent_session()
-                self._json({"authorized": True, "host": session.host, "port": session.port, "username": session.username, **session_connection_policy()})
+                token, session = self.server.state.agent_session()
+                self._json({"authorized": True, "session": token, "host": session.host, "port": session.port, "username": session.username, **session_connection_policy(session.backend)})
                 return
             if request.path == "/api/v1/agent/terminals":
                 if query:
@@ -1652,13 +1731,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 if self.server.state.sessiond.enabled:
                     self._sessiond_json("POST", "/internal/v1/sessions", data)
                     return
-                token, _ = self.server.state.open_session(_session_request(data))
+                token, session = self.server.state.open_session(_session_request(data))
                 try:
                     status_data = collect_session_status(self.server.state, token)
                 except BaseException:
                     self.server.state.close_session(token)
                     raise
-                self._json({"session": token, **session_connection_policy(), "status": status_data}, HTTPStatus.CREATED)
+                recovery_token = self.server.state.issue_session_recovery(session)
+                self._json({"session": token, **session_connection_policy(session.backend), "status": status_data}, HTTPStatus.CREATED, {"Set-Cookie": session_recovery_cookie(recovery_token)})
                 return
             session_logs = re.fullmatch(r"/api/v1/sessions/([A-Za-z0-9_-]{20,80})/logs", path)
             if session_logs:
@@ -1749,8 +1829,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if self.server.state.sessiond.enabled:
                 self._sessiond_json("DELETE", f"/internal/v1/sessions/{match.group(1)}")
                 return
-            self.server.state.close_session(match.group(1))
-            self._json({"closed": True})
+            try:
+                self.server.state.close_session(match.group(1))
+                closed = True
+            except KeyError:
+                closed = False
+            self._json({"closed": closed}, extra_headers={"Set-Cookie": clear_session_recovery_cookie()})
         except KeyError as exc:
             self._json({"error": str(exc).strip("'\"")}, HTTPStatus.NOT_FOUND)
 

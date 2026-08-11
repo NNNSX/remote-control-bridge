@@ -18,6 +18,7 @@ export function sessionConnectionPolicy() {
     idle_timeout_enabled: false,
     keepalive_interval_seconds: SSH_KEEPALIVE_INTERVAL_MS / 1000,
     keepalive_failure_threshold: SSH_KEEPALIVE_COUNT_MAX,
+    disconnect_detection: "keepalive_count",
   };
 }
 

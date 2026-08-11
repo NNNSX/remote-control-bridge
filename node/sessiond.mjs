@@ -16,6 +16,7 @@ import { mediaTypeForPath } from "./lib/file-media.mjs";
 import { decodeTextPreview, isKnownBinaryPath, MAX_IMAGE_PREVIEW_BYTES, MAX_TEXT_PREVIEW_BYTES } from "./lib/file-preview.mjs";
 import { RemoteTaskService } from "./lib/remote-task-service.mjs";
 import { AGENT_GRANT_TTL_SECONDS, createTerminal, ensureTerminal, scheduleAgentGrantRenewal, sessionConnectionPolicy, sshKeepaliveOptions, stopAgentGrantRenewal } from "./lib/session-policy.mjs";
+import { clearRecoveryCookie, issueSessionRecovery, recoverSession, recoveryCookie } from "./lib/session-recovery.mjs";
 import { createSftpTaskRemote } from "./lib/sftp-task-remote.mjs";
 import { SftpTusStore } from "./lib/sftp-tus-store.mjs";
 import { TaskIndex, taskOwnerKey } from "./lib/task-index.mjs";
@@ -51,10 +52,10 @@ const pendingHostKeys = new Map();
 let nextJob = 1;
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 
-function json(response, status, value) {
+function json(response, status, value, headers = {}) {
   const body = JSON.stringify(value);
   try {
-    response.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": Buffer.byteLength(body), "cache-control": "no-store" });
+    response.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": Buffer.byteLength(body), "cache-control": "no-store", ...headers });
     response.end(body);
   } catch (error) {
     if (!['EPIPE', 'ECONNRESET', 'ECONNABORTED'].includes(error?.code)) throw error;
@@ -167,7 +168,7 @@ async function revokeAgentGrant(session) {
   if (grantId) { try { await control.revoke(grantId); } catch {} }
 }
 async function closeSession(session, endClient = true) { if (session.taskReconcileTimer) clearTimeout(session.taskReconcileTimer); sessions.delete(session.id); for (const job of session.jobs.values()) { job.cancel = true; job.stream?.close(); } if (endClient) { try { session.client.end(); } catch {} } await revokeAgentGrant(session); }
-function sessionInfo(session) { return { session: session.id, host: session.host, port: session.port, username: session.username, fingerprint: session.fingerprint, ...sessionConnectionPolicy() }; }
+function sessionInfo(session) { return { session: session.id, host: session.host, port: session.port, username: session.username, fingerprint: session.fingerprint, agent_enabled: session.agentEnabled, ...sessionConnectionPolicy() }; }
 function getSession(idValue) { const session = sessions.get(idValue); if (!session) throw new Error("unknown or disconnected session"); return session; }
 async function agentSession(scope) {
   for (const session of [...sessions.values()].reverse()) {
@@ -467,6 +468,11 @@ const server = http.createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/internal/v1/health") return json(response, 200, { ok: true, mode: "ssh-session-daemon", sessions: sessions.size });
     if (url.pathname.startsWith("/internal/v1/transfers")) return await tusServer.handle(request, response);
     if (request.method === "POST" && url.pathname === "/internal/v1/host-keys/trust") return json(response, 200, await trustPending((await readBody(request)).token));
+    if (request.method === "GET" && url.pathname === "/internal/v1/sessions/recover") {
+      const recovered = recoverSession(sessions, request.headers.cookie);
+      if (!recovered) return json(response, 404, { error: "no recoverable SSH session" }, { "set-cookie": clearRecoveryCookie() });
+      return json(response, 200, { ...sessionInfo(recovered.session), status: await collectStatus(recovered.session) }, { "set-cookie": recoveryCookie(recovered.token) });
+    }
     if (url.pathname.startsWith("/internal/v1/agent")) {
       const suffix = url.pathname.slice("/internal/v1/agent".length).replace(/^\//, "");
       const taskEndpoint = suffix === "tasks" || suffix.startsWith("tasks/");
@@ -529,7 +535,8 @@ const server = http.createServer(async (request, response) => {
         session.client.once("close", () => {
           if (sessions.has(session.id)) void closeSession(session, false);
         });
-        return json(response, 201, { ...sessionInfo(session), status: await collectStatus(session) });
+        const recoveryToken = issueSessionRecovery(session);
+        return json(response, 201, { ...sessionInfo(session), status: await collectStatus(session) }, { "set-cookie": recoveryCookie(recoveryToken) });
       } catch (error) {
         try { connection.client.end(); } catch {}
         throw error;
@@ -537,6 +544,11 @@ const server = http.createServer(async (request, response) => {
     }
     const match = url.pathname.match(/^\/internal\/v1\/sessions\/([^/]+)(?:\/(.*))?$/);
     if (match) {
+      if (request.method === "DELETE" && !match[2]) {
+        const existing = sessions.get(match[1]);
+        if (existing) await closeSession(existing);
+        return json(response, 200, { closed: Boolean(existing) }, { "set-cookie": clearRecoveryCookie() });
+      }
       const session = getSession(match[1]); const suffix = match[2] || "";
       if (request.method === "GET" && suffix === "status") return json(response, 200, { ...(await collectStatus(session)), jobs: [...session.jobs.values()].map(jobInfo) });
       if (request.method === "GET" && suffix === "terminals") return json(response, 200, { terminals: [...session.terminals.values()].map((terminal) => ({ ...terminal, jobs: terminal.jobs.map(jobInfo) })) });
@@ -576,7 +588,6 @@ const server = http.createServer(async (request, response) => {
       if (request.method === "POST" && suffix === "files/rename") { const data = await readBody(request); const from = safeRelative(data.from); const to = safeRelative(data.to); const { sftp } = await sftpCall(session, "rename", from, to); closeSftp(sftp); return json(response, 200, { from, to, renamed: true }); }
       if (request.method === "DELETE" && suffix === "files") return json(response, 200, await fileDelete(session, url.searchParams.get("path") || ""));
       if (request.method === "DELETE" && suffix.startsWith("jobs/")) { const job = session.jobs.get(suffix.split("/")[1]); if (!job) throw new Error("unknown job"); job.cancel = true; job.stream?.close(); return json(response, 202, { cancelled: true, job_id: job.id }); }
-      if (request.method === "DELETE" && !suffix) { await closeSession(session); return json(response, 200, { closed: true }); }
     }
     return json(response, 404, { error: "not found" });
   } catch (error) {

@@ -18,6 +18,8 @@ test("Task Center controls are wired to existing DOM elements without exposing r
   assert.match(html, /data-view-panel="tasks"/);
   assert.match(script, /\/api\/v1\/agent\/tasks\/cleanup-preview/);
   assert.match(script, /\/api\/v1\/agent\/session/);
+  assert.match(script, /\/api\/v1\/sessions\/recover/);
+  assert.match(script, /if \(await restoreBrowserSession\(\)\) return true;/);
   assert.match(script, /\/logs\?stream=/);
   assert.match(html, /id="taskObserverState"/);
   assert.match(html, /id="taskGpuPanel"/);

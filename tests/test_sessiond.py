@@ -36,9 +36,13 @@ class SessionDaemonTests(unittest.TestCase):
         self.thread.join(timeout=2)
         self.tempdir.cleanup()
 
-    def request(self, method: str, path: str, body: dict | None = None, key: str | None = None) -> tuple[int, dict]:
+    def request_full(
+        self, method: str, path: str, body: dict | None = None, key: str | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict, http.client.HTTPMessage]:
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
         headers = {"Host": self.server.authority, "X-Session-Key": key if key is not None else self.key.hex()}
+        headers.update(extra_headers or {})
         encoded = None
         if body is not None:
             encoded = json.dumps(body).encode("utf-8")
@@ -46,8 +50,13 @@ class SessionDaemonTests(unittest.TestCase):
         connection.request(method, path, body=encoded, headers=headers)
         response = connection.getresponse()
         payload = json.loads(response.read().decode("utf-8"))
+        response_headers = response.headers
         connection.close()
-        return response.status, payload
+        return response.status, payload, response_headers
+
+    def request(self, method: str, path: str, body: dict | None = None, key: str | None = None) -> tuple[int, dict]:
+        status, payload, _ = self.request_full(method, path, body, key)
+        return status, payload
 
     def test_health_requires_internal_key(self) -> None:
         status, payload = self.request("GET", "/internal/v1/health")
@@ -61,7 +70,7 @@ class SessionDaemonTests(unittest.TestCase):
         with mock.patch.object(self.state, "open_session", return_value=("temporary-session-token", live)) as opened, mock.patch.object(
             sessiond.bridge, "collect_session_status", return_value={"hostname": "amax"}
         ):
-            status, payload = self.request("POST", "/internal/v1/sessions", {
+            status, payload, headers = self.request_full("POST", "/internal/v1/sessions", {
                 "protocol": "ssh", "host": "192.0.2.10", "port": 22,
                 "username": "remote-user", "password": "temporary-only",
             })
@@ -71,9 +80,30 @@ class SessionDaemonTests(unittest.TestCase):
         self.assertIsNone(payload["expires_in_seconds"])
         self.assertFalse(payload["idle_timeout_enabled"])
         self.assertEqual(payload["keepalive_interval_seconds"], 30)
-        self.assertEqual(payload["keepalive_failure_threshold"], 10)
+        self.assertIsNone(payload["keepalive_failure_threshold"])
+        self.assertEqual(payload["disconnect_detection"], "transport")
+        self.assertIn("HttpOnly; SameSite=Strict", headers["Set-Cookie"])
         self.assertEqual(opened.call_args.args[0]["password"], "temporary-only")
         self.assertFalse(hasattr(live, "password"))
+
+    def test_browser_recovery_is_cookie_bound_and_independent_of_agent_access(self) -> None:
+        token = "temporary-session-token"
+        client = mock.MagicMock()
+        client.get_transport.return_value.is_active.return_value = True
+        live = sessiond.bridge.LiveSession(client, "192.0.2.10", 22, "remote-user", None, fingerprint="SHA256:test")
+        self.state.sessions[token] = live
+        recovery_token = self.state.issue_session_recovery(live)
+        cookie = f"{sessiond.bridge.SESSION_RECOVERY_COOKIE}={recovery_token}"
+        with mock.patch.object(sessiond.bridge, "collect_session_status", return_value={"hostname": "amax"}):
+            status, payload, headers = self.request_full("GET", "/internal/v1/sessions/recover", extra_headers={"Cookie": cookie})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["session"], token)
+        self.assertFalse(live.agent_enabled)
+        self.assertIn("Max-Age=", headers["Set-Cookie"])
+
+        status, _, headers = self.request_full("GET", "/internal/v1/sessions/recover", extra_headers={"Cookie": "rcb_session_recovery=invalid"})
+        self.assertEqual(status, 404)
+        self.assertIn("Max-Age=0", headers["Set-Cookie"])
 
     def test_command_status_and_close_are_delegated(self) -> None:
         with mock.patch.object(sessiond.bridge, "submit_session_command", return_value={"job_id": "job-abcdefghijkl", "terminal_id": "term-abcdefgh"}) as submit:
@@ -83,10 +113,16 @@ class SessionDaemonTests(unittest.TestCase):
         submit.assert_called_once()
 
         with mock.patch.object(self.state, "close_session") as close:
-            status, payload = self.request("DELETE", "/internal/v1/sessions/temporary-session-token")
+            status, payload, headers = self.request_full("DELETE", "/internal/v1/sessions/temporary-session-token")
         self.assertEqual(status, 200)
         self.assertTrue(payload["closed"])
+        self.assertIn("Max-Age=0", headers["Set-Cookie"])
         close.assert_called_once_with("temporary-session-token")
+
+        status, payload, headers = self.request_full("DELETE", "/internal/v1/sessions/missing-session-token")
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["closed"])
+        self.assertIn("Max-Age=0", headers["Set-Cookie"])
 
     def test_key_persists_and_rejects_invalid_length(self) -> None:
         path = Path(self.tempdir.name) / "sessiond.key"

@@ -118,6 +118,8 @@ test("Agent access requires a fingerprint-bound Control grant and revokes immedi
 
   response = await fetch(`${api}/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(connectBody) });
   assert.equal(response.status, 201);
+  const recoveryCookie = response.headers.get("set-cookie")?.split(";", 1)[0];
+  assert.match(recoveryCookie || "", /^rcb_session_recovery=[A-Za-z0-9_-]+$/);
   const created = await response.json();
   assert.match(created.fingerprint, /^SHA256:/);
   assert.equal(created.expires_in_seconds, null);
@@ -125,6 +127,14 @@ test("Agent access requires a fingerprint-bound Control grant and revokes immedi
   assert.equal(created.keepalive_interval_seconds, 30);
   assert.equal(created.keepalive_failure_threshold, 10);
   const sessionId = created.session;
+
+  response = await fetch(`${api}/sessions/recover`, { headers: { cookie: recoveryCookie } });
+  assert.equal(response.status, 200);
+  const recovered = await response.json();
+  assert.equal(recovered.session, sessionId);
+  assert.equal(recovered.status.host, "127.0.0.1");
+  assert.match(response.headers.get("set-cookie") || "", /HttpOnly; SameSite=Strict/);
+  assert.equal((await fetch(`${api}/sessions/recover`, { headers: { cookie: "rcb_session_recovery=invalid" } })).status, 404);
 
   response = await fetch(`${api}/agent/session`);
   assert.equal(response.status, 403);
@@ -207,6 +217,12 @@ test("Agent access requires a fingerprint-bound Control grant and revokes immedi
   assert.equal(Object.values(grants).some((grant) => !grant.revoked), true);
   response = await fetch(`${api}/sessions/${sessionId}`, { method: "DELETE" });
   assert.equal(response.status, 200);
+  assert.match(response.headers.get("set-cookie") || "", /Max-Age=0/);
+  response = await fetch(`${api}/sessions/${sessionId}`, { method: "DELETE" });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).closed, false);
+  assert.match(response.headers.get("set-cookie") || "", /Max-Age=0/);
+  assert.equal((await fetch(`${api}/sessions/recover`, { headers: { cookie: recoveryCookie } })).status, 404);
   grants = JSON.parse(await fs.readFile(path.join(dataDir, "control_grants.json"), "utf8"));
   assert.equal(Object.values(grants).every((grant) => grant.revoked), true);
 });

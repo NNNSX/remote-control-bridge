@@ -1159,7 +1159,15 @@ async function restoreAgentSession() {
   } catch { return false; }
 }
 
+async function restoreBrowserSession() {
+  try {
+    const recovered = await request("/api/v1/sessions/recover");
+    return activateRestoredSession(recovered.session, recovered.status, { agentEnabled: recovered.agent_enabled === true, message: "已恢复浏览器保留的 SSH 会话" });
+  } catch { return false; }
+}
+
 async function restoreActiveSession() {
+  if (await restoreBrowserSession()) return true;
   const saved = readActiveSession();
   if (!saved?.session) return restoreAgentSession();
   try {

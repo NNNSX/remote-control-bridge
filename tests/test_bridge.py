@@ -242,6 +242,27 @@ class SessionTests(unittest.TestCase):
             self.assertIs(state.session(token), session)
         self.assertIn(token, state.sessions)
 
+    def test_recovery_token_is_hashed_and_bound_to_the_ssh_fingerprint(self) -> None:
+        state = bridge.BridgeState(self.config)
+        token = "temporary-session-token"
+        client = mock.MagicMock()
+        client.get_transport.return_value.is_active.return_value = True
+        session = bridge.LiveSession(client, "192.0.2.10", 22, "remote-user", None, fingerprint="SHA256:test")
+        state.sessions[token] = session
+        recovery_token = state.issue_session_recovery(session)
+        self.assertNotIn(recovery_token, repr(session))
+        cookie = bridge.session_recovery_cookie(recovery_token)
+        self.assertEqual(state.recover_session(cookie)[0], token)
+        session.fingerprint = "SHA256:changed"
+        with self.assertRaisesRegex(KeyError, "recoverable"):
+            state.recover_session(cookie)
+
+    def test_connection_policy_matches_the_python_ssh_backend(self) -> None:
+        self.assertEqual(bridge.session_connection_policy("paramiko")["disconnect_detection"], "transport")
+        self.assertIsNone(bridge.session_connection_policy("paramiko")["keepalive_failure_threshold"])
+        self.assertEqual(bridge.session_connection_policy("asyncssh")["disconnect_detection"], "keepalive_count")
+        self.assertEqual(bridge.session_connection_policy("asyncssh")["keepalive_failure_threshold"], 10)
+
     def test_disconnected_session_is_removed_on_access(self) -> None:
         state = bridge.BridgeState(self.config)
         token = "temporary-session-token"
@@ -448,9 +469,9 @@ class ServerTests(unittest.TestCase):
     def test_session_routes_proxy_to_session_daemon(self) -> None:
         sessiond = mock.MagicMock()
         sessiond.enabled = True
-        sessiond.request.side_effect = [
-            (201, {"session": "temporary-session-token", "status": {"hostname": "amax"}}),
-            (200, {"hostname": "amax"}),
+        sessiond.request_with_headers.side_effect = [
+            (201, {"session": "temporary-session-token", "status": {"hostname": "amax"}}, {"set-cookie": "rcb_session_recovery=token; Path=/; HttpOnly"}),
+            (200, {"hostname": "amax"}, {}),
         ]
         self.server.state.sessiond = sessiond
         payload = json.dumps({
@@ -460,13 +481,48 @@ class ServerTests(unittest.TestCase):
         self.connection.request("POST", "/api/v1/sessions", payload, {"Content-Type": "application/json"})
         response = self.connection.getresponse()
         self.assertEqual(response.status, 201)
+        self.assertIn("HttpOnly", response.getheader("Set-Cookie"))
         self.assertEqual(json.loads(response.read())["status"]["hostname"], "amax")
         self.connection.request("GET", "/api/v1/sessions/temporary-session-token/status")
         response = self.connection.getresponse()
         self.assertEqual(response.status, 200)
         self.assertEqual(json.loads(response.read())["hostname"], "amax")
-        self.assertEqual(sessiond.request.call_args_list[0].args[0:2], ("POST", "/internal/v1/sessions"))
-        self.assertEqual(sessiond.request.call_args_list[1].args, ("GET", "/internal/v1/sessions/temporary-session-token/status", None))
+        self.assertEqual(sessiond.request_with_headers.call_args_list[0].args, ("POST", "/internal/v1/sessions", json.loads(payload), {}))
+        self.assertEqual(sessiond.request_with_headers.call_args_list[1].args, ("GET", "/internal/v1/sessions/temporary-session-token/status", None, {}))
+
+    def test_split_session_recovery_forwards_cookie_and_agent_session_id(self) -> None:
+        sessiond = mock.MagicMock()
+        sessiond.enabled = True
+        sessiond.request_with_headers.return_value = (
+            200, {"session": "temporary-session-token", "status": {"hostname": "amax"}},
+            {"set-cookie": "rcb_session_recovery=refreshed; Path=/; HttpOnly"},
+        )
+        self.server.state.sessiond = sessiond
+        self.connection.request("GET", "/api/v1/sessions/recover", headers={"Cookie": "rcb_session_recovery=original"})
+        response = self.connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertIn("refreshed", response.getheader("Set-Cookie"))
+        self.assertEqual(json.loads(response.read())["session"], "temporary-session-token")
+        self.assertEqual(sessiond.request_with_headers.call_args.args[-1], {"Cookie": "rcb_session_recovery=original"})
+
+        sessiond.request.return_value = (200, {"authorized": True, "session": "temporary-session-token"})
+        self.connection.request("GET", "/api/v1/agent/session")
+        response = self.connection.getresponse()
+        self.assertEqual(json.loads(response.read())["session"], "temporary-session-token")
+
+    def test_integrated_agent_discovery_returns_the_session_id(self) -> None:
+        token = "temporary-session-token"
+        client = mock.MagicMock()
+        client.get_transport.return_value.is_active.return_value = True
+        session = bridge.LiveSession(client, "192.0.2.10", 22, "remote-user", None)
+        session.agent_enabled = True
+        self.server.state.sessions[token] = session
+        self.connection.request("GET", "/api/v1/agent/session")
+        response = self.connection.getresponse()
+        self.assertEqual(response.status, 200)
+        payload = json.loads(response.read())
+        self.assertEqual(payload["session"], token)
+        self.assertEqual(payload["disconnect_detection"], "transport")
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ test("sessions use protocol keepalive without an application idle timeout", () =
     idle_timeout_enabled: false,
     keepalive_interval_seconds: 30,
     keepalive_failure_threshold: 10,
+    disconnect_detection: "keepalive_count",
   });
 });
 
