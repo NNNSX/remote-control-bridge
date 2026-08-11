@@ -300,9 +300,10 @@ pre { max-height: 320px; overflow: auto; padding: 12px; border: 1px solid var(--
 .workspace-tab:hover:not(:disabled) { border-color: #b7d3d0; background: #f7fbfa; }
 .workspace-tab.active { border-color: #c2dcd8; background: #fff; color: #145f57; box-shadow: 0 1px 3px rgba(24, 48, 54, .12); }
 .workspace-tab:disabled { opacity: .42; }
-.workspace.is-connected[data-view="overview"] #dashboard { display: flex; flex: 1; flex-direction: column; min-height: 420px; }
-.workspace.is-connected[data-view="overview"] .status-dashboard { flex: 1; }
-.workspace.is-connected[data-view="overview"] .gauge-board, .workspace.is-connected[data-view="overview"] .status-dashboard > .gpu-panel-group { height: 100%; }
+.workspace.is-connected[data-view="overview"] #dashboard { display: flex; flex: 1 1 0; flex-direction: column; min-height: 0; padding: 0 4px 28px 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.workspace.is-connected[data-view="overview"] .metric-grid { flex: 0 0 auto; }
+.workspace.is-connected[data-view="overview"] .status-dashboard { flex: 1 0 auto; align-items: stretch; min-height: 0; }
+.workspace.is-connected[data-view="overview"] .gauge-board, .workspace.is-connected[data-view="overview"] .status-dashboard > .gpu-panel-group { height: auto; }
 .workspace.is-connected[data-view="terminal"] .terminal { display: flex; flex: 1; flex-direction: column; min-height: 450px; }
 .workspace.is-connected[data-view="terminal"] .terminal-output { flex: 1; max-height: none; min-height: 240px; }
 .workspace.is-connected[data-view="terminal"] .terminal-ledger { flex: 0 1 220px; }
@@ -424,6 +425,7 @@ pre { max-height: 320px; overflow: auto; padding: 12px; border: 1px solid var(--
 
 @media (min-width: 841px) and (max-height: 650px) {
   .workspace { overflow-y: auto; }
+  .workspace.is-connected[data-view="overview"] { overflow: hidden; }
   .workspace.is-connected[data-view="files"] .workspace-grid { flex: 0 0 500px; height: 500px; min-height: 500px; }
   .workspace.is-connected[data-view="tasks"] .task-center { flex: 0 0 540px; height: 540px; min-height: 540px; }
 }

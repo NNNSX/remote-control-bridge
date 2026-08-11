@@ -39,4 +39,7 @@ test("Task Center controls are wired to existing DOM elements without exposing r
   assert.match(styles, /max-height:\s*650px/);
   assert.match(styles, /data-view="files"\]\s+\.workspace-grid\s*\{\s*flex:\s*0 0 500px;\s*height:\s*500px;\s*min-height:\s*500px;/);
   assert.match(styles, /data-view="tasks"\]\s+\.task-center\s*\{\s*flex:\s*0 0 540px;\s*height:\s*540px;\s*min-height:\s*540px;/);
+  assert.match(styles, /data-view="overview"\]\s+#dashboard\s*\{[^}]*min-height:\s*0;[^}]*overflow-y:\s*auto;/);
+  assert.match(styles, /data-view="overview"\]\s+\.status-dashboard\s*\{[^}]*flex:\s*1 0 auto;[^}]*align-items:\s*stretch;/);
+  assert.doesNotMatch(styles, /data-view="overview"\]\s+#dashboard\s*\{[^}]*min-height:\s*420px;/);
 });
