@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Remote Control Bridge</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand"><span class="brand-mark">RC</span><div><strong>Remote Control Bridge</strong><small>本地 SSH 工作台</small></div></div>
+    <span id="health" class="health-pill">本地服务检查中</span>
+  </header>
+  <main class="app-shell">
+    <aside class="connection-panel" aria-labelledby="connectionTitle">
+      <div class="panel-heading"><div><span class="eyebrow">SESSION</span><h1 id="connectionTitle">连接服务器</h1></div></div>
+      <form id="connectForm" class="connection-form">
+        <label>已保存连接<select id="savedProfile"><option value="">选择连接配置</option></select></label>
+        <div class="profile-actions"><button id="deleteProfile" type="button" disabled>删除配置</button></div>
+        <label>协议<select id="protocol" name="protocol"><option value="ssh">SSH</option></select></label>
+        <label>认证方式<select id="authMethod" name="auth_method"><option value="password" selected>密码登录</option><option value="key">SSH 密钥</option></select></label>
+        <label>主机<input id="host" name="host" autocomplete="off" placeholder="192.0.2.10" required></label>
+        <div class="field-row"><label>端口<input id="port" name="port" type="number" min="1" max="65535" value="22" required></label><label>用户名<input id="username" name="username" autocomplete="username" placeholder="remote-user" required></label></div>
+        <label id="passwordField">密码<input id="password" name="password" type="password" autocomplete="current-password"></label>
+        <label class="connection-option"><input id="saveProfile" type="checkbox" checked>保存连接配置（不含密码）</label>
+        <label class="connection-option"><input id="agentEnabled" type="checkbox" checked>允许本地 Agent</label>
+        <p class="connection-option-note">授权本地 Agent 读取状态、安全文件并执行终端任务；不包含文件写入，可随时取消。</p>
+        <div class="commands"><button id="connect" class="primary" type="submit">连接并读取状态</button><button id="disconnect" type="button" disabled>断开</button></div>
+      </form>
+      <div class="connection-note">密码只用于本次 SSH 握手，不会写入配置、日志或磁盘。</div>
+    </aside>
+    <section id="workspace" class="workspace" data-view="overview" aria-live="polite">
+      <div class="workspace-heading"><div><span class="eyebrow">REMOTE WORKSPACE</span><h1 id="hostTitle">尚未连接</h1><p id="hostMeta"></p></div><button id="refresh" class="secondary" type="button" disabled>刷新状态</button></div>
+      <nav class="workspace-tabs" aria-label="工作区视图" role="tablist">
+        <button class="workspace-tab active" id="workspaceTabOverview" data-view="overview" role="tab" aria-selected="true" type="button">概览</button>
+        <button class="workspace-tab" id="workspaceTabTerminal" data-view="terminal" role="tab" aria-selected="false" type="button" disabled>终端</button>
+        <button class="workspace-tab" id="workspaceTabTasks" data-view="tasks" role="tab" aria-selected="false" type="button" disabled>任务</button>
+        <button class="workspace-tab" id="workspaceTabFiles" data-view="files" role="tab" aria-selected="false" type="button" disabled>文件</button>
+        <button class="workspace-tab" id="workspaceTabLogs" data-view="logs" role="tab" aria-selected="false" type="button" disabled>日志</button>
+      </nav>
+      <div id="notice" class="notice">输入 SSH 信息后连接服务器。</div>
+      <div id="emptyWorkspace" class="empty-workspace"><strong>尚未连接远程服务器</strong><span>填写左侧 SSH 信息并连接后，这里会显示状态、终端、日志和文件管理。</span></div>
+      <div class="monitor-toolbar"><label>自动刷新<select id="refreshInterval" disabled><option value="5">5 秒</option><option value="15" selected>15 秒</option><option value="30">30 秒</option><option value="60">60 秒</option><option value="0">关闭</option></select></label><button id="pauseMonitoring" type="button" disabled>暂停监控</button><span id="lastRefresh" class="last-refresh">尚未采集</span><span id="alertBadge" class="alert-badge" hidden></span></div>
+      <div id="dashboard" class="dashboard"></div>
+      <section id="jobOverview" class="job-overview" hidden><div class="section-heading"><h2>活动任务</h2><span id="jobCount"></span></div><div id="jobRows"></div></section>
+      <section class="workspace-section terminal" data-view-panel="terminal">
+        <div class="section-heading terminal-topline"><div><span class="eyebrow">COMMANDS</span><h2>并行终端</h2><div id="terminalTabs" class="terminal-tabs"></div></div><div class="terminal-actions"><button id="stopCommand" class="icon-button stop-command" type="button" title="停止当前任务" disabled>■</button><button id="renameTerminal" class="icon-button" type="button" title="重命名当前终端" disabled>✎</button><button id="newTerminal" class="icon-button" type="button" title="下一条命令使用新终端" aria-pressed="false" disabled>+</button></div></div>
+        <form id="terminalForm" class="terminal-form"><input id="commandInput" type="text" list="commandHistory" autocomplete="off" placeholder="输入远程命令，例如 nvidia-smi" disabled><datalist id="commandHistory"></datalist><label class="timeout-field">超时<input id="commandTimeout" type="number" min="1" max="3600" value="120" disabled><span>秒</span></label><button id="runCommand" class="primary" type="submit" disabled>执行</button></form>
+        <pre id="terminalOutput" class="terminal-output" hidden></pre>
+        <section id="terminalLedger" class="terminal-ledger" hidden aria-label="当前终端的最近任务"></section>
+      </section>
+      <section class="workspace-section task-center" data-view-panel="tasks" aria-labelledby="taskCenterTitle">
+        <div class="section-heading task-center-heading">
+          <div><span class="eyebrow">PERSISTENT TASKS</span><h2 id="taskCenterTitle">任务中心</h2><p id="taskCapabilitySummary" class="section-caption">等待读取任务能力</p></div>
+          <div class="task-heading-actions"><span id="taskObserverState" class="task-observer-state">未监控</span><button id="refreshTasks" type="button" disabled>刷新</button></div>
+        </div>
+        <div class="task-storage-strip" aria-label="任务存储统计">
+          <div><span>远端记录</span><strong id="taskRemoteCount">-</strong></div>
+          <div><span>远端占用</span><strong id="taskRemoteBytes">-</strong></div>
+          <div><span>本地历史</span><strong id="taskLocalCount">-</strong></div>
+          <div><span>固定记录</span><strong id="taskPinnedCount">-</strong></div>
+          <div><span>扫描状态</span><strong id="taskScanStatus">-</strong></div>
+        </div>
+        <div class="task-toolbar">
+          <div class="task-mode-switch" role="tablist" aria-label="任务列表">
+            <button class="task-mode active" data-task-mode="active" type="button" role="tab" aria-selected="true">当前</button>
+            <button class="task-mode" data-task-mode="history" type="button" role="tab" aria-selected="false">历史</button>
+          </div>
+          <label class="task-status-filter">状态<select id="taskStatusFilter"><option value="">全部</option><option value="completed">已完成</option><option value="failed">失败</option><option value="cancelled">已取消</option><option value="interrupted">已中断</option><option value="unknown">未知</option></select></label>
+          <button id="previewTaskCleanup" type="button" disabled>清理预演</button>
+          <span id="taskCleanupSummary" class="task-cleanup-summary">尚未预演</span>
+        </div>
+        <div class="task-center-body">
+          <div class="task-list-pane">
+            <div class="task-pane-title"><strong id="taskListTitle">当前任务</strong><span id="taskListCount">0 条</span></div>
+            <div id="taskList" class="task-list"><div class="task-empty">暂无任务数据</div></div>
+            <button id="loadMoreTasks" class="task-load-more" type="button" hidden>加载更早记录</button>
+          </div>
+          <div class="task-detail-pane">
+            <div id="taskDetailEmpty" class="task-detail-empty">选择左侧任务查看状态和日志</div>
+            <div id="taskDetail" hidden>
+              <div class="task-detail-heading"><div><span id="taskDetailStatus" class="task-status">-</span><strong id="taskDetailId"></strong></div><div class="task-detail-actions"><button id="pinTask" type="button">固定</button><button id="cancelTask" class="danger-button" type="button">取消任务</button></div></div>
+              <dl id="taskMetadata" class="task-metadata"></dl>
+              <section id="taskGpuPanel" class="task-gpu-panel" hidden aria-labelledby="taskGpuTitle"><div class="task-gpu-heading"><strong id="taskGpuTitle">GPU 观察</strong><span id="taskGpuSummary"></span></div><div id="taskGpuList" class="task-gpu-grid"></div></section>
+              <div class="task-log-toolbar"><label>日志<select id="taskLogStream"><option value="stdout">stdout</option><option value="stderr">stderr</option></select></label><label class="task-follow"><input id="taskLogFollow" type="checkbox" checked>自动续读</label><button id="reloadTaskLog" type="button">从头读取</button><span id="taskLogOffset">offset 0</span></div>
+              <div id="taskLogNotice" class="task-log-notice" hidden></div>
+              <pre id="taskLogOutput" class="task-log-output">（日志为空）</pre>
+            </div>
+          </div>
+        </div>
+      </section>
+      <div class="workspace-grid">
+        <section class="workspace-section logs" data-view-panel="logs"><div class="section-heading"><div><span class="eyebrow">LOGS</span><h2>日志读取</h2></div></div><div class="inline-form"><input id="logPath" type="text" placeholder="相对路径，例如 logs/train.log" disabled><button id="readLog" type="button" disabled>读取</button></div><pre id="logOutput" hidden></pre></section>
+        <section class="workspace-section files" data-view-panel="files" aria-labelledby="filesTitle">
+          <div class="section-heading"><div><span class="eyebrow">SFTP</span><h2 id="filesTitle">文件管理</h2></div></div>
+          <div class="file-location"><span>当前目录</span><code id="fileCurrentDirectory">.</code></div>
+          <div class="file-toolbar"><button id="parentFolder" type="button" title="返回上一级目录" disabled>上一级</button><button id="listFiles" type="button" disabled>刷新目录</button><button id="newFolder" type="button" disabled>新建目录</button></div>
+          <div class="file-transfer-actions" aria-label="文件操作">
+            <input id="transferFileInput" type="file" multiple hidden disabled>
+            <input id="transferFolderInput" type="file" webkitdirectory directory multiple hidden disabled>
+            <button id="chooseTransferFiles" type="button" title="上传文件到当前目录" disabled>上传文件</button>
+            <button id="chooseTransferFolder" type="button" title="上传目录到当前目录" disabled>上传目录</button>
+            <button id="downloadFile" type="button" title="下载选中的文件" disabled>下载</button>
+            <button id="renameFile" type="button" title="重命名选中的文件或目录" disabled>重命名</button>
+            <button id="deleteFile" class="danger-button" type="button" title="删除选中的文件或空目录" disabled>删除</button>
+            <span id="fileSelection" class="file-selection">未选择项目</span>
+          </div>
+          <div class="file-browser">
+            <div class="file-tree-pane"><div class="file-pane-title">目录树</div><div id="fileList" class="file-tree"></div></div>
+            <div id="fileEditor" class="file-editor"><div class="file-editor-empty">选择左侧文件进行预览或编辑</div><div class="file-editor-content" hidden><div class="file-editor-topline"><strong id="fileEditorPath"></strong><div class="file-editor-actions"><button id="toggleFileView" type="button">编辑</button><button id="saveFile" type="button">保存</button></div></div><div id="filePreviewNotice" class="file-preview-notice" hidden></div><img id="fileImagePreview" class="file-image-preview" alt="" hidden><pre id="fileHighlight" class="file-highlight" hidden></pre><textarea id="fileContent" spellcheck="false" hidden></textarea></div></div>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+  <aside id="transferPanel" class="transfer-panel" aria-labelledby="transferPanelTitle" hidden>
+    <div class="transfer-panel-header">
+      <div><strong id="transferPanelTitle">上传任务</strong><span id="transferSummary">暂无任务</span></div>
+      <div class="transfer-panel-actions"><button id="refreshTransfers" class="icon-button" type="button" title="刷新上传任务" disabled>↻</button><button id="minimizeTransfers" class="icon-button" type="button" title="最小化上传窗口">−</button><button id="closeTransfers" class="icon-button" type="button" title="关闭上传窗口">×</button></div>
+    </div>
+    <div id="transferQueue" class="transfer-queue"></div>
+  </aside>
+  <button id="showTransfers" class="transfer-launcher" type="button" title="打开上传任务" hidden>上传任务</button>
+  <script src="/job-stream.js"></script>
+  <script src="/tus.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

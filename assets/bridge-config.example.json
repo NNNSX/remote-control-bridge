@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "connect_timeout": 10,
+  "command_timeout": 45,
+  "hosts": [
+    {
+      "name": "example-host",
+      "target": "example-host",
+      "workdir": "/home/remote-user/project",
+      "logs": [
+        {
+          "name": "training",
+          "path": "/home/remote-user/project/runs/example-001/stdout.log",
+          "max_lines": 200
+        }
+      ],
+      "artifact_root": "/home/remote-user/project/.bridge-inbox",
+      "artifacts": []
+    }
+  ]
+}
