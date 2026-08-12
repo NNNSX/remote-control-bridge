@@ -35,7 +35,7 @@ const knownHostsPath = path.join(dataDir, "known_hosts");
 const keyPath = path.join(dataDir, "sessiond.key");
 const persistentTasksEnabled = ["1", "true", "yes"].includes(String(options["persistent-tasks"] || process.env.RCB_PERSISTENT_TASKS || "").toLowerCase());
 const remoteTaskDeletionEnabled = persistentTasksEnabled && ["1", "true", "yes"].includes(String(options["remote-task-deletion"] || process.env.RCB_REMOTE_TASK_DELETION || "").toLowerCase());
-const agentGrantScopes = enabledAgentScopes({ remoteTaskDeletionEnabled });
+const agentGrantScopes = enabledAgentScopes({ persistentTasksEnabled, remoteTaskDeletionEnabled });
 if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("--port must be between 1024 and 65535");
 if (!Number.isInteger(controlPort) || controlPort < 1024 || controlPort > 65535) throw new Error("--control-port must be between 1024 and 65535");
 
@@ -62,11 +62,11 @@ function json(response, status, value, headers = {}) {
   }
 }
 
-async function readBody(request) {
+async function readBody(request, maxBytes = 131072) {
   let raw = "";
   for await (const chunk of request) {
     raw += chunk;
-    if (Buffer.byteLength(raw) > 131072) throw new Error("request body is too large");
+    if (Buffer.byteLength(raw) > maxBytes) throw new Error("request body is too large");
   }
   const value = JSON.parse(raw || "{}");
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("request body must be an object");
@@ -370,7 +370,7 @@ async function filePreview(session, relative) {
 }
 async function fileWrite(session, relative, content) {
   const safe = safeRelative(relative);
-  if (typeof content !== "string" || Buffer.byteLength(content, "utf8") > 1048576) throw new Error("text content must be at most 1 MiB");
+  if (typeof content !== "string") throw new Error("text content must be a string");
   const { sftp, result: handle } = await sftpCall(session, "open", safe, "w");
   const buffer = Buffer.from(content, "utf8");
   try { if (buffer.length) await new Promise((resolve, reject) => sftp.write(handle, buffer, 0, buffer.length, 0, (error) => error ? reject(error) : resolve())); }
@@ -494,6 +494,11 @@ const server = http.createServer(async (request, response) => {
       if (request.method === "GET" && suffix === "files/preview") return json(response, 200, { ...(await filePreview(session, url.searchParams.get("path") || "")), session: session.id });
       if (request.method === "GET" && suffix === "files/media") return await fileMedia(session, url.searchParams.get("path") || "", response);
       if (request.method === "GET" && suffix === "files/download") return await fileDownload(session, url.searchParams.get("path") || "", response);
+      if (request.method === "PUT" && suffix === "files/content") { const data = await readBody(request, Number.MAX_SAFE_INTEGER); return json(response, 200, await fileWrite(session, data.path, data.content)); }
+      if (request.method === "PUT" && suffix === "files/upload") return json(response, 201, await fileUpload(session, url.searchParams.get("path") || "", request));
+      if (request.method === "POST" && suffix === "files/mkdir") { const data = await readBody(request); const safe = safeRelative(data.path); const { sftp } = await sftpCall(session, "mkdir", safe); closeSftp(sftp); return json(response, 201, { path: safe, created: true }); }
+      if (request.method === "POST" && suffix === "files/rename") { const data = await readBody(request); const from = safeRelative(data.from); const to = safeRelative(data.to); const { sftp } = await sftpCall(session, "rename", from, to); closeSftp(sftp); return json(response, 200, { from, to, renamed: true }); }
+      if (request.method === "DELETE" && suffix === "files") return json(response, 200, await fileDelete(session, url.searchParams.get("path") || ""));
       if (request.method === "POST" && suffix === "logs") {
         const data = await readBody(request); const safe = safeRelative(data.path || ""); const preview = await filePreview(session, safe); return json(response, 200, { path: safe, content: tailTextLines(preview.content, data.lines), truncated: preview.truncated, session: session.id });
       }

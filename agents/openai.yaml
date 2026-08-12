@@ -1,4 +1,4 @@
 interface:
   display_name: "Remote Control Bridge"
-  short_description: "Secure loopback SSH workspace and Agent bridge"
-  default_prompt: "Use $remote-control-bridge to inspect and operate my authorized remote SSH host through the local bridge."
+  short_description: "Loopback SSH/SFTP proxy with browser and Agent APIs"
+  default_prompt: "Use $remote-control-bridge as the local SSH/SFTP proxy for my authorized remote host."

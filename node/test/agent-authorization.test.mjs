@@ -50,7 +50,27 @@ function commandResult(command) {
 
 test("Agent access requires a fingerprint-bound Control grant and revokes immediately", async (context) => {
   const agentFile = Buffer.from("line 1\nline 2\nline 3\n", "utf8");
-  const fileAttrs = () => ({ mode: 0o100644, uid: 1000, gid: 1000, size: agentFile.length, atime: Math.floor(Date.now() / 1000), mtime: Math.floor(Date.now() / 1000) });
+  const files = new Map([["agent.txt", Buffer.from(agentFile)]]);
+  const directories = new Set(["."]);
+  const fileAttrs = (remotePath = "agent.txt") => ({ mode: directories.has(remotePath) ? 0o040755 : 0o100644, uid: 1000, gid: 1000, size: files.get(remotePath)?.length || 0, atime: Math.floor(Date.now() / 1000), mtime: Math.floor(Date.now() / 1000) });
+  const normalize = (remotePath) => String(remotePath || ".").replace(/^\.\//, "").replace(/\/$/, "") || ".";
+  const parent = (remotePath) => normalize(remotePath).split("/").slice(0, -1).join("/") || ".";
+  const descendants = (remotePath) => {
+    const base = normalize(remotePath);
+    const names = new Map();
+    for (const dir of directories) {
+      if (dir === base || !dir.startsWith(`${base}/`)) continue;
+      const rest = dir.slice(base.length + 1).split("/");
+      if (rest.length === 1) names.set(rest[0], { type: "directory" });
+    }
+    for (const file of files.keys()) {
+      const relative = base === "." ? file : file.startsWith(`${base}/`) ? file.slice(base.length + 1) : null;
+      if (relative == null) continue;
+      const rest = relative.split("/");
+      if (rest.length === 1) names.set(rest[0], { type: "file" });
+    }
+    return [...names.entries()];
+  };
   const privateKey = await fs.readFile(path.join(nodeDir, "node_modules", "ssh2", "test", "fixtures", "ssh_host_ecdsa_key"));
   const ssh = new SshServer({ hostKeys: [privateKey] }, (client) => {
     client.on("error", () => {});
@@ -70,24 +90,42 @@ test("Agent access requires a fingerprint-bound Control grant and revokes immedi
         let nextHandle = 1;
         const openHandle = (value) => { const handle = Buffer.alloc(4); handle.writeUInt32BE(nextHandle, 0); handles.set(nextHandle, value); nextHandle += 1; return handle; };
         const getHandle = (handle) => handle.length === 4 ? handles.get(handle.readUInt32BE(0)) : null;
-        sftp.on("REALPATH", (reqid, remotePath) => sftp.name(reqid, [{ filename: remotePath || ".", longname: remotePath || ".", attrs: { mode: 0o040755 } }]));
-        sftp.on("OPENDIR", (reqid, remotePath) => remotePath === "." ? sftp.handle(reqid, openHandle({ type: "directory", sent: false })) : sftp.status(reqid, STATUS_CODE.NO_SUCH_FILE));
+        sftp.on("REALPATH", (reqid, remotePath) => sftp.name(reqid, [{ filename: normalize(remotePath), longname: normalize(remotePath), attrs: fileAttrs(normalize(remotePath)) }]));
+        sftp.on("OPENDIR", (reqid, remotePath) => {
+          const target = normalize(remotePath);
+          return directories.has(target) ? sftp.handle(reqid, openHandle({ type: "directory", path: target, sent: false })) : sftp.status(reqid, STATUS_CODE.NO_SUCH_FILE);
+        });
         sftp.on("READDIR", (reqid, handle) => {
           const entry = getHandle(handle);
           if (!entry || entry.type !== "directory") return sftp.status(reqid, STATUS_CODE.FAILURE);
           if (entry.sent) return sftp.status(reqid, STATUS_CODE.EOF);
           entry.sent = true;
-          sftp.name(reqid, [{ filename: "agent.txt", longname: "-rw-r--r-- 1 user user 21 agent.txt", attrs: fileAttrs() }]);
+          sftp.name(reqid, descendants(entry.path).map(([name, value]) => ({ filename: name, longname: name, attrs: fileAttrs(entry.path === "." ? name : `${entry.path}/${name}`) })));
         });
-        sftp.on("OPEN", (reqid, remotePath, flags) => remotePath === "agent.txt" && (flags & OPEN_MODE.READ) ? sftp.handle(reqid, openHandle({ type: "file" })) : sftp.status(reqid, STATUS_CODE.NO_SUCH_FILE));
-        sftp.on("STAT", (reqid, remotePath) => remotePath === "agent.txt" ? sftp.attrs(reqid, fileAttrs()) : sftp.status(reqid, STATUS_CODE.NO_SUCH_FILE));
-        sftp.on("LSTAT", (reqid, remotePath) => remotePath === "agent.txt" ? sftp.attrs(reqid, fileAttrs()) : sftp.status(reqid, STATUS_CODE.NO_SUCH_FILE));
-        sftp.on("FSTAT", (reqid, handle) => getHandle(handle)?.type === "file" ? sftp.attrs(reqid, fileAttrs()) : sftp.status(reqid, STATUS_CODE.FAILURE));
+        sftp.on("OPEN", (reqid, remotePath, flags) => {
+          const target = normalize(remotePath);
+          if (directories.has(target)) return sftp.status(reqid, STATUS_CODE.FAILURE);
+          if (flags & OPEN_MODE.READ) return files.has(target) ? sftp.handle(reqid, openHandle({ type: "file", path: target })) : sftp.status(reqid, STATUS_CODE.NO_SUCH_FILE);
+          files.set(target, Buffer.alloc(0));
+          return sftp.handle(reqid, openHandle({ type: "file", path: target, writable: true }));
+        });
+        sftp.on("STAT", (reqid, remotePath) => { const target = normalize(remotePath); return (files.has(target) || directories.has(target)) ? sftp.attrs(reqid, fileAttrs(target)) : sftp.status(reqid, STATUS_CODE.NO_SUCH_FILE); });
+        sftp.on("LSTAT", (reqid, remotePath) => { const target = normalize(remotePath); return (files.has(target) || directories.has(target)) ? sftp.attrs(reqid, fileAttrs(target)) : sftp.status(reqid, STATUS_CODE.NO_SUCH_FILE); });
+        sftp.on("FSTAT", (reqid, handle) => { const entry = getHandle(handle); return entry?.type === "file" ? sftp.attrs(reqid, fileAttrs(entry.path)) : sftp.status(reqid, STATUS_CODE.FAILURE); });
         sftp.on("READ", (reqid, handle, offset, length) => {
-          if (getHandle(handle)?.type !== "file") return sftp.status(reqid, STATUS_CODE.FAILURE);
-          if (offset >= agentFile.length) return sftp.status(reqid, STATUS_CODE.EOF);
-          sftp.data(reqid, agentFile.subarray(offset, Math.min(agentFile.length, offset + length)));
+          const entry = getHandle(handle); const content = entry?.type === "file" ? files.get(entry.path) : null;
+          if (!content) return sftp.status(reqid, STATUS_CODE.FAILURE);
+          if (offset >= content.length) return sftp.status(reqid, STATUS_CODE.EOF);
+          sftp.data(reqid, content.subarray(offset, Math.min(content.length, offset + length)));
         });
+        sftp.on("WRITE", (reqid, handle, offset, data) => {
+          const entry = getHandle(handle); if (!entry?.writable) return sftp.status(reqid, STATUS_CODE.FAILURE);
+          const current = files.get(entry.path) || Buffer.alloc(0); const next = Buffer.alloc(Math.max(current.length, offset + data.length)); current.copy(next); data.copy(next, offset); files.set(entry.path, next); sftp.status(reqid, STATUS_CODE.OK);
+        });
+        sftp.on("MKDIR", (reqid, remotePath) => { const target = normalize(remotePath); return directories.has(target) || files.has(target) ? sftp.status(reqid, STATUS_CODE.FAILURE) : (directories.add(target), sftp.status(reqid, STATUS_CODE.OK)); });
+        sftp.on("RENAME", (reqid, from, to) => { const source = normalize(from); const target = normalize(to); if (files.has(source)) { files.set(target, files.get(source)); files.delete(source); } else if (directories.has(source)) { directories.add(target); directories.delete(source); } else return sftp.status(reqid, STATUS_CODE.NO_SUCH_FILE); sftp.status(reqid, STATUS_CODE.OK); });
+        sftp.on("REMOVE", (reqid, remotePath) => { const target = normalize(remotePath); return files.delete(target) ? sftp.status(reqid, STATUS_CODE.OK) : sftp.status(reqid, STATUS_CODE.NO_SUCH_FILE); });
+        sftp.on("RMDIR", (reqid, remotePath) => { const target = normalize(remotePath); return target !== "." && directories.delete(target) ? sftp.status(reqid, STATUS_CODE.OK) : sftp.status(reqid, STATUS_CODE.FAILURE); });
         sftp.on("CLOSE", (reqid, handle) => { if (handle.length === 4) handles.delete(handle.readUInt32BE(0)); sftp.status(reqid, STATUS_CODE.OK); });
       });
     }));
@@ -145,8 +183,8 @@ test("Agent access requires a fingerprint-bound Control grant and revokes immedi
   assert.equal((await response.json()).enabled, true);
   let grants = JSON.parse(await fs.readFile(path.join(dataDir, "control_grants.json"), "utf8"));
   const activeGrant = Object.values(grants).find((grant) => !grant.revoked);
-  assert.deepEqual(activeGrant.scopes, ["files:read", "jobs:cancel", "jobs:execute", "jobs:read", "status:read", "tasks:cancel", "tasks:execute", "tasks:read"]);
-  assert.equal(activeGrant.scopes.includes("files:write"), false);
+  assert.deepEqual(activeGrant.scopes, ["files:read", "files:write", "jobs:cancel", "jobs:execute", "jobs:read", "status:read", "tasks:cancel", "tasks:execute", "tasks:read"]);
+  assert.equal(activeGrant.scopes.includes("files:write"), true);
   response = await fetch(`${api}/agent/session`);
   assert.equal(response.status, 200);
   const discovered = await response.json();
@@ -186,8 +224,30 @@ test("Agent access requires a fingerprint-bound Control grant and revokes immedi
   assert.equal(response.status, 200);
   assert.equal((await response.json()).content, "line 2\nline 3\n");
 
+  response = await fetch(`${api}/agent/files/content`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: "written.txt", content: "written by Agent" }) });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { path: "written.txt", written: true, bytes: 16 });
+  assert.equal(files.get("written.txt").toString("utf8"), "written by Agent");
+
+  response = await fetch(`${api}/agent/files/upload?path=uploaded.bin`, { method: "PUT", headers: { "content-type": "application/octet-stream" }, body: Buffer.from([0, 1, 2, 255]) });
+  assert.equal(response.status, 201);
+  assert.deepEqual(await response.json(), { path: "uploaded.bin", uploaded: true, bytes: 4 });
+  assert.deepEqual([...files.get("uploaded.bin")], [0, 1, 2, 255]);
+
+  response = await fetch(`${api}/agent/files/mkdir`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: "created" }) });
+  assert.equal(response.status, 201);
+  assert.equal(directories.has("created"), true);
+
+  response = await fetch(`${api}/agent/files/rename`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ from: "written.txt", to: "created/renamed.txt" }) });
+  assert.equal(response.status, 200);
+  assert.equal(files.has("written.txt"), false);
+
+  response = await fetch(`${api}/agent/files?path=uploaded.bin`, { method: "DELETE" });
+  assert.equal(response.status, 200, await response.text());
+  assert.equal(files.has("uploaded.bin"), false);
+
   assert.equal((await fetch(`${api}/agent/files/preview?path=.ssh/id_ed25519`)).status, 400);
-  assert.equal((await fetch(`${api}/agent/files?path=.`, { method: "DELETE" })).status, 404);
+  assert.equal((await fetch(`${api}/agent/files?path=.`, { method: "DELETE" })).status, 400);
 
   response = await fetch(`${api}/agent/commands`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ command: "pwd", timeout_seconds: 0 }) });
   assert.equal(response.status, 400);

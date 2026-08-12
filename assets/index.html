@@ -24,7 +24,7 @@
         <label id="passwordField">密码<input id="password" name="password" type="password" autocomplete="current-password"></label>
         <label class="connection-option"><input id="saveProfile" type="checkbox" checked>保存连接配置（不含密码）</label>
         <label class="connection-option"><input id="agentEnabled" type="checkbox" checked>允许本地 Agent</label>
-        <p class="connection-option-note">授权本地 Agent 读取状态、安全文件并执行终端任务；不包含文件写入，可随时取消。</p>
+        <p class="connection-option-note">授权本地 Agent 使用当前 SSH 会话，包括命令和 SFTP 文件操作；可随时取消。</p>
         <div class="commands"><button id="connect" class="primary" type="submit">连接并读取状态</button><button id="disconnect" type="button" disabled>断开</button></div>
       </form>
       <div class="connection-note">密码只用于本次 SSH 握手，不会写入配置、日志或磁盘。</div>

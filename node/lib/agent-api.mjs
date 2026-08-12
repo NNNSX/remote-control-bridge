@@ -1,5 +1,10 @@
-export const AGENT_SCOPES = ["status:read", "jobs:read", "jobs:execute", "jobs:cancel", "files:read", "tasks:read", "tasks:execute", "tasks:cancel"];
-export function enabledAgentScopes({ remoteTaskDeletionEnabled = false } = {}) { return remoteTaskDeletionEnabled ? [...AGENT_SCOPES, "tasks:delete"] : [...AGENT_SCOPES]; }
+export const BASE_AGENT_SCOPES = ["status:read", "jobs:read", "jobs:execute", "jobs:cancel", "files:read", "files:write"];
+export const TASK_AGENT_SCOPES = ["tasks:read", "tasks:execute", "tasks:cancel"];
+export const AGENT_SCOPES = [...BASE_AGENT_SCOPES, ...TASK_AGENT_SCOPES];
+export function enabledAgentScopes({ persistentTasksEnabled = false, remoteTaskDeletionEnabled = false } = {}) {
+  const scopes = persistentTasksEnabled ? [...AGENT_SCOPES] : [...BASE_AGENT_SCOPES];
+  return remoteTaskDeletionEnabled && persistentTasksEnabled ? [...scopes, "tasks:delete"] : scopes;
+}
 
 export function agentScopeForRequest(method, suffix) {
   const verb = String(method || "").toUpperCase();
@@ -10,6 +15,9 @@ export function agentScopeForRequest(method, suffix) {
   if (verb === "GET" && /^jobs\/[^/]+(?:\/events)?$/.test(route)) return "jobs:read";
   if (verb === "DELETE" && /^jobs\/[^/]+$/.test(route)) return "jobs:cancel";
   if (verb === "GET" && ["files", "files/preview", "files/media", "files/download"].includes(route)) return "files:read";
+  if (verb === "PUT" && ["files/content", "files/upload"].includes(route)) return "files:write";
+  if (verb === "POST" && ["files/mkdir", "files/rename"].includes(route)) return "files:write";
+  if (verb === "DELETE" && route === "files") return "files:write";
   if (verb === "POST" && route === "logs") return "files:read";
   if (verb === "GET" && (route === "tasks" || route === "tasks/capabilities" || route === "tasks/history" || route === "tasks/storage" || route === "tasks/cleanup-preview" || /^tasks\/[^/]+(?:\/logs)?$/.test(route))) return "tasks:read";
   if (verb === "POST" && (route === "tasks" || route === "tasks/reconcile" || route === "tasks/maintenance" || /^tasks\/[^/]+\/(?:pin|unpin)$/.test(route))) return "tasks:execute";
