@@ -125,15 +125,18 @@ function renderStatus(data) {
   const disk = typeof data.root_disk === "object" ? data.root_disk : {};
   const cpu = typeof data.cpu === "object" ? data.cpu : {};
   const memory = typeof data.memory === "object" ? data.memory : {};
-  const diskPercent = percent(disk.used_percent);
-  const cpuPercent = percent(cpu.usage_percent);
-  const memoryPercent = percent(memory.used_percent);
+  const numeric = (value) => Number.isFinite(Number(value));
+  const displayPercent = (value) => numeric(value) ? `${percent(value)}%` : "未采样";
+  const gaugePercent = (value) => numeric(value) ? percent(value) : 0;
+  const diskPercent = gaugePercent(disk.used_percent);
+  const cpuPercent = gaugePercent(cpu.usage_percent);
+  const memoryPercent = gaugePercent(memory.used_percent);
   const gpus = Array.isArray(data.gpus) ? data.gpus : [];
   const memoryDetail = Number.isFinite(Number(memory.used_kib)) && Number.isFinite(Number(memory.total_kib)) ? `${formatGiB(memory.used_kib)} 已用 · ${formatGiB(memory.available_kib)} 可用` : "等待数据";
   const diskDetail = Number.isFinite(Number(disk.used_kib)) && Number.isFinite(Number(disk.total_kib)) ? `${formatGiB(disk.used_kib)} / ${formatGiB(disk.total_kib)}` : "等待数据";
   const gpuUsed = gpus.reduce((sum, gpu) => sum + (Number(gpu.memory_used_mib) || 0), 0);
   const gpuTotal = gpus.reduce((sum, gpu) => sum + (Number(gpu.memory_total_mib) || 0), 0);
-  const gauge = (label, value, detail, tone) => `<article class="gauge-card"><div class="dial" style="--value:${value};--gauge-color:${tone}"><div class="dial-inner"><strong>${value}%</strong><span>实时</span></div></div><div class="gauge-copy"><span>${label}</span><strong>${detail}</strong></div></article>`;
+  const gauge = (label, value, rawValue, detail, tone) => `<article class="gauge-card"><div class="dial" style="--value:${value};--gauge-color:${tone}"><div class="dial-inner"><strong>${displayPercent(rawValue)}</strong><span>实时</span></div></div><div class="gauge-copy"><span>${label}</span><strong>${detail}</strong></div></article>`;
   const gpuHtml = gpus.length ? gpus.map((gpu) => {
     const utilization = percent(gpu.utilization_percent);
     const gpuMemory = Number(gpu.memory_total_mib) ? percent(Number(gpu.memory_used_mib) * 100 / Number(gpu.memory_total_mib)) : 0;
@@ -142,7 +145,8 @@ function renderStatus(data) {
   const loads = String(data.load_average || "0 0 0").split(/\s+/).slice(0, 3).map(Number).map((value) => Number.isFinite(value) ? value : 0);
   const loadMax = Math.max(1, ...loads);
   const loadHtml = loads.map((value, index) => `<div class="load-meter"><span>${index === 0 ? "1 分钟" : index === 1 ? "5 分钟" : "15 分钟"}</span><div class="bar"><i style="width:${Math.min(100, value * 100 / loadMax)}%"></i></div><b>${value.toFixed(2)}</b></div>`).join("");
-  $("#dashboard").innerHTML = `<div class="metric-grid"><div class="metric"><span>主机名</span><strong>${escapeHtml(data.hostname)}</strong></div><div class="metric"><span>在线时间</span><strong>${escapeHtml(formatUptime(data.uptime_seconds))}</strong></div><div class="metric"><span>处理器</span><strong>${cpu.cores ? `${escapeHtml(cpu.cores)} 核` : "未知"}</strong></div><div class="metric"><span>内存总量</span><strong>${Number.isFinite(Number(memory.total_kib)) ? formatGiB(memory.total_kib) : "未知"}</strong></div><div class="metric"><span>系统负载</span><strong>${escapeHtml(data.load_average || "未知")}</strong></div><div class="metric"><span>用户主目录</span><strong>${escapeHtml(data.workdir)}</strong></div></div><div class="status-dashboard"><section class="gauge-board"><div class="dashboard-heading"><div><span class="eyebrow">SYSTEM HEALTH</span><h2>系统资源</h2></div><span class="dashboard-caption">实时采样</span></div><div class="gauge-cards">${gauge("CPU 使用率", cpuPercent, cpu.cores ? `${cpu.cores} 核处理器` : "等待数据", "#177a70")}${gauge("内存使用率", memoryPercent, memoryDetail, "#467e9d")}${gauge("根分区使用率", diskPercent, diskDetail, "#b5782b")}</div><div class="load-panel"><div class="load-title"><strong>系统负载</strong><span>${escapeHtml(data.load_average || "未知")}</span></div>${loadHtml}</div></section><section class="gpu-panel-group"><div class="dashboard-heading"><div><span class="eyebrow">ACCELERATOR</span><h2>GPU 资源</h2></div><span class="dashboard-caption">${gpus.length ? `${gpus.length} 张设备 · ${gpuUsed} / ${gpuTotal} MiB 显存` : "未检测到设备"}</span></div><div class="gpu-grid">${gpuHtml}</div></section></div>`;
+  const sampleState = data.sample_status === "complete" ? "采样完整" : data.sample_status === "partial" ? `部分采样：${(data.sampling_errors || []).join("、")}` : "采样状态未知";
+  $("#dashboard").innerHTML = `<div class="metric-grid"><div class="metric"><span>主机名</span><strong>${escapeHtml(data.hostname)}</strong></div><div class="metric"><span>在线时间</span><strong>${escapeHtml(formatUptime(data.uptime_seconds))}</strong></div><div class="metric"><span>处理器</span><strong>${cpu.cores ? `${escapeHtml(cpu.cores)} 核` : "未知"}</strong></div><div class="metric"><span>内存总量</span><strong>${Number.isFinite(Number(memory.total_kib)) ? formatGiB(memory.total_kib) : "未知"}</strong></div><div class="metric"><span>系统负载</span><strong>${escapeHtml(data.load_average || "未知")}</strong></div><div class="metric"><span>用户主目录</span><strong>${escapeHtml(data.workdir)}</strong></div></div><div class="status-dashboard"><section class="gauge-board"><div class="dashboard-heading"><div><span class="eyebrow">SYSTEM HEALTH</span><h2>系统资源</h2></div><span class="dashboard-caption">${escapeHtml(sampleState)}</span></div><div class="gauge-cards">${gauge("CPU 使用率", cpuPercent, cpu.usage_percent, cpu.cores ? `${cpu.cores} 核处理器` : "等待数据", "#177a70")}${gauge("内存使用率", memoryPercent, memory.used_percent, memoryDetail, "#467e9d")}${gauge("根分区使用率", diskPercent, disk.used_percent, diskDetail, "#b5782b")}</div><div class="load-panel"><div class="load-title"><strong>系统负载</strong><span>${escapeHtml(data.load_average || "未知")}</span></div>${loadHtml}</div></section><section class="gpu-panel-group"><div class="dashboard-heading"><div><span class="eyebrow">ACCELERATOR</span><h2>GPU 资源</h2></div><span class="dashboard-caption">${gpus.length ? `${gpus.length} 张设备 · ${gpuUsed} / ${gpuTotal} MiB 显存` : "未检测到设备"}</span></div><div class="gpu-grid">${gpuHtml}</div></section></div>`;
   if (state.selectedTask) renderTaskGpu(state.selectedTask);
   showNotice(`状态更新于 ${new Date().toLocaleTimeString()}`);
 }

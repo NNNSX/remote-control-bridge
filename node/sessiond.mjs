@@ -194,13 +194,26 @@ async function agentSession(scope) {
   throw error;
 }
 
-function execOnce(client, command) {
+function execOnce(client, command, timeoutMs = 5000) {
   return new Promise((resolve, reject) => client.exec(command, (error, stream) => {
     if (error) return reject(error);
+    let settled = false;
     let output = "";
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback(value);
+    };
+    const timer = setTimeout(() => {
+      try { stream.close(); } catch {}
+      finish(reject, new Error(`remote status command timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    timer.unref?.();
     stream.on("data", (chunk) => { output += chunk.toString(); });
     stream.stderr.on("data", () => {});
-    stream.on("close", (code) => code === 0 ? resolve(output.trim()) : reject(new Error(`remote status command exited with ${code}`)));
+    stream.on("error", (streamError) => finish(reject, streamError));
+    stream.on("close", (code) => code === 0 ? finish(resolve, output.trim()) : finish(reject, new Error(`remote status command exited with ${code}`)));
   }));
 }
 
@@ -212,38 +225,48 @@ async function collectStatus(session) {
   let memory = null;
   let rootDisk = null;
   let gpus = [];
-  try { hostname = await execOnce(session.client, "hostname"); } catch {}
-  try { uptime = Number(await execOnce(session.client, "awk '{print int($1)}' /proc/uptime")); if (!Number.isFinite(uptime)) uptime = null; } catch {}
-  try { loadAverage = (await execOnce(session.client, "awk '{print $1\" \"$2\" \"$3}' /proc/loadavg")).trim(); } catch {}
-  try {
-    const cores = Number(await execOnce(session.client, "getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1"));
-    const sample = await execOnce(session.client, "awk '/^cpu / {print $2+$3+$4+$6+$7+$8+$9+$10+$11, $5; exit}' /proc/stat; sleep 0.2; awk '/^cpu / {print $2+$3+$4+$6+$7+$8+$9+$10+$11, $5; exit}' /proc/stat");
-    const rows = sample.split(/\r?\n/).map((row) => row.trim().split(/\s+/).map(Number)).filter((row) => row.length >= 2 && row.every(Number.isFinite));
-    if (rows.length >= 2) {
-      const totalDelta = rows[1][0] - rows[0][0];
-      const busyDelta = totalDelta - (rows[1][1] - rows[0][1]);
+  const systemCommand = [
+    "printf 'hostname='; hostname 2>/dev/null || true",
+    "printf 'uptime='; awk '{print int($1)}' /proc/uptime 2>/dev/null || true",
+    "printf 'load='; awk '{print $1\" \"$2\" \"$3}' /proc/loadavg 2>/dev/null || true",
+    "printf 'cores='; (getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || true)",
+    "printf 'cpu_before='; awk '/^cpu / {print $2+$3+$4+$6+$7+$8+$9+$10+$11, $5; exit}' /proc/stat 2>/dev/null || true",
+    "sleep 0.2",
+    "printf 'cpu_after='; awk '/^cpu / {print $2+$3+$4+$6+$7+$8+$9+$10+$11, $5; exit}' /proc/stat 2>/dev/null || true",
+    "printf 'memory='; awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{if(t){u=t-a; printf \"%d %d %d %.1f\\n\", t,u,a,u*100/t}}' /proc/meminfo 2>/dev/null || true",
+    "printf 'disk='; df -Pk \"$HOME\" 2>/dev/null | awk 'NR==2 {gsub(/%/,\"\",$5); print $2,$3,$4,$5}'",
+  ].join("; ");
+  const gpuCommand = "if command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits; fi";
+  const [systemResult, gpuResult] = await Promise.allSettled([execOnce(session.client, systemCommand), execOnce(session.client, gpuCommand)]);
+  if (systemResult.status === "fulfilled") {
+    const fields = Object.fromEntries(systemResult.value.split(/\r?\n/).map((line) => line.split(/=(.*)/s).slice(0, 2)).filter((parts) => parts.length === 2));
+    if (fields.hostname) hostname = fields.hostname.trim();
+    uptime = Number(fields.uptime); if (!Number.isFinite(uptime)) uptime = null;
+    loadAverage = fields.load?.trim() || null;
+    const cores = Number(fields.cores);
+    const before = String(fields.cpu_before || "").trim().split(/\s+/).map(Number);
+    const after = String(fields.cpu_after || "").trim().split(/\s+/).map(Number);
+    if (before.length >= 2 && after.length >= 2 && [...before, ...after].every(Number.isFinite)) {
+      const totalDelta = after[0] - before[0];
+      const busyDelta = totalDelta - (after[1] - before[1]);
       cpu = { cores: Number.isFinite(cores) ? cores : null, usage_percent: totalDelta > 0 ? Math.max(0, Math.min(100, Number((busyDelta * 100 / totalDelta).toFixed(1)))) : null };
     }
-  } catch {}
-  try {
-    const fields = (await execOnce(session.client, "awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{if(t){u=t-a; printf \"%d %d %d %.1f\", t,u,a,u*100/t}}' /proc/meminfo")).split(/\s+/).map(Number);
-    if (fields.length >= 4 && fields.slice(0, 4).every(Number.isFinite)) memory = { total_kib: fields[0], used_kib: fields[1], available_kib: fields[2], used_percent: fields[3] };
-  } catch {}
-  try {
-    const disk = await execOnce(session.client, "df -Pk \"$HOME\" | tail -n 1");
-    const fields = disk.trim().split(/\s+/);
-    if (fields.length >= 5) rootDisk = { total_kib: Number(fields[1]), used_kib: Number(fields[2]), available_kib: Number(fields[3]), used_percent: Number(String(fields[4]).replace("%", "")) };
-  } catch {}
-  try {
-    const csv = await execOnce(session.client, "command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits");
+    const memoryFields = String(fields.memory || "").trim().split(/\s+/).map(Number);
+    if (memoryFields.length >= 4 && memoryFields.every(Number.isFinite)) memory = { total_kib: memoryFields[0], used_kib: memoryFields[1], available_kib: memoryFields[2], used_percent: memoryFields[3] };
+    const diskFields = String(fields.disk || "").trim().split(/\s+/).map(Number);
+    if (diskFields.length >= 4 && diskFields.every(Number.isFinite)) rootDisk = { total_kib: diskFields[0], used_kib: diskFields[1], available_kib: diskFields[2], used_percent: diskFields[3] };
+  }
+  if (gpuResult.status === "fulfilled") {
+    const csv = gpuResult.value;
     gpus = csv.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => {
       const fields = line.split(/\s*,\s*/);
       if (fields.length < 6) return null;
       const number = (value) => { const result = Number(String(value).replace(/[^0-9.+-]/g, "")); return Number.isFinite(result) ? result : null; };
       return { index: number(fields[0]), name: fields[1], utilization_percent: number(fields[2]), memory_used_mib: number(fields[3]), memory_total_mib: number(fields[4]), temperature_c: number(fields[5]) };
     }).filter(Boolean);
-  } catch {}
-  return { host: session.host, port: session.port, username: session.username, hostname, uptime_seconds: uptime, workdir: "$HOME", load_average: loadAverage, cpu, memory, root_disk: rootDisk, gpus, collected_at: Math.floor(Date.now() / 1000) };
+  }
+  const samplingErrors = [...(systemResult.status === "rejected" ? ["system"] : []), ...(gpuResult.status === "rejected" ? ["gpu"] : [])];
+  return { host: session.host, port: session.port, username: session.username, hostname, uptime_seconds: uptime, workdir: "$HOME", load_average: loadAverage, cpu, memory, root_disk: rootDisk, gpus, sample_status: samplingErrors.length ? "partial" : "complete", sampling_errors: samplingErrors, collected_at: Math.floor(Date.now() / 1000) };
 }
 
 function appendEvent(job, type, data) { job.events.push({ id: ++job.lastEvent, type, data }); if (job.events.length > 512) job.events.shift(); }
