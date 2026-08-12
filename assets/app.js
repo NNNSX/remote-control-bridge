@@ -59,6 +59,7 @@ function setWorkspaceView(view) {
     tab.classList.toggle("active", active); tab.setAttribute("aria-selected", String(active));
   }
   if (next === "terminal") setTimeout(() => $("#commandInput")?.focus(), 0);
+  if (next === "overview" && state.session) void refresh({ silent: true });
   if (next === "tasks") { refreshTaskCenter({ resetHistory: !state.taskLoaded }); scheduleTaskStatusPolling(); scheduleTaskLogPolling(); }
   else { clearTimeout(state.taskStatusTimer); state.taskStatusTimer = null; clearTimeout(state.taskLogTimer); state.taskLogTimer = null; }
 }
@@ -151,14 +152,14 @@ function scheduleMonitoring() {
   if (!state.session || state.monitoringPaused) return;
   const seconds = Number($("#refreshInterval").value || 0);
   if (!seconds) return;
-  state.monitorTimer = setTimeout(async () => { await refresh(); scheduleMonitoring(); }, seconds * 1000);
+  state.monitorTimer = setTimeout(async () => { try { await refresh({ silent: true }); } finally { scheduleMonitoring(); } }, seconds * 1000);
 }
 function toggleMonitoringPause() {
   state.monitoringPaused = !state.monitoringPaused;
   $("#pauseMonitoring").textContent = state.monitoringPaused ? "恢复监控" : "暂停监控";
-  if (state.monitoringPaused) clearTimeout(state.monitorTimer); else { refresh(); scheduleMonitoring(); }
+  if (state.monitoringPaused) clearTimeout(state.monitorTimer); else { void refresh({ silent: true }); scheduleMonitoring(); }
 }
-function updateRefreshSchedule() { state.monitoringPaused = false; $("#pauseMonitoring").textContent = "暂停监控"; scheduleMonitoring(); }
+function updateRefreshSchedule() { state.monitoringPaused = false; $("#pauseMonitoring").textContent = "暂停监控"; void refresh({ silent: true }); scheduleMonitoring(); }
 
 function renderJobOverview() {
   const jobs = [...state.terminals.values()].flatMap((terminal) => terminal.jobs.map((job) => ({ ...job, terminal: terminal.index })));
@@ -249,11 +250,19 @@ function deleteProfile() {
   showNotice("连接配置已删除。");
 }
 
-async function refresh() {
-  if (!state.session) return; $("#refresh").disabled = true; showNotice("正在读取远程状态…");
+async function refreshNow({ silent = false } = {}) {
+  if (!state.session) return false; $("#refresh").disabled = true; if (!silent) showNotice("正在读取远程状态…");
   try { renderStatus(await request(`/api/v1/sessions/${encodeURIComponent(state.session)}/status`)); $("#lastRefresh").textContent = `更新于 ${new Date().toLocaleTimeString()}`; }
-  catch (error) { showNotice(`状态读取失败：${error.message}`); }
-  finally { $("#refresh").disabled = false; }
+  catch (error) { if (!silent) showNotice(`状态读取失败：${error.message}`); return false; }
+  finally { $("#refresh").disabled = !state.session; }
+}
+
+let monitorInFlight = false;
+async function refresh(options = {}) {
+  if (!state.session || monitorInFlight) return false;
+  monitorInFlight = true;
+  try { return await refreshNow(options); }
+  finally { monitorInFlight = false; }
 }
 
 async function readLog() {
