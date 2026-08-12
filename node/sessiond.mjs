@@ -14,12 +14,9 @@ import { agentScopeForRequest, enabledAgentScopes, parseCommandRequest, tailText
 import { createControlClient } from "./lib/control-client.mjs";
 import { mediaTypeForPath } from "./lib/file-media.mjs";
 import { decodeTextPreview, isKnownBinaryPath, MAX_IMAGE_PREVIEW_BYTES, MAX_TEXT_PREVIEW_BYTES } from "./lib/file-preview.mjs";
-import { RemoteTaskService } from "./lib/remote-task-service.mjs";
 import { AGENT_GRANT_TTL_SECONDS, createTerminal, ensureTerminal, scheduleAgentGrantRenewal, sessionConnectionPolicy, sshKeepaliveOptions, stopAgentGrantRenewal } from "./lib/session-policy.mjs";
 import { clearRecoveryCookie, issueSessionRecovery, recoverSession, recoveryCookie } from "./lib/session-recovery.mjs";
-import { createSftpTaskRemote } from "./lib/sftp-task-remote.mjs";
 import { SftpTusStore } from "./lib/sftp-tus-store.mjs";
-import { TaskIndex, taskOwnerKey } from "./lib/task-index.mjs";
 import { authorizeTusRequest } from "./lib/tus-request.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -36,6 +33,15 @@ const keyPath = path.join(dataDir, "sessiond.key");
 const persistentTasksEnabled = ["1", "true", "yes"].includes(String(options["persistent-tasks"] || process.env.RCB_PERSISTENT_TASKS || "").toLowerCase());
 const remoteTaskDeletionEnabled = persistentTasksEnabled && ["1", "true", "yes"].includes(String(options["remote-task-deletion"] || process.env.RCB_REMOTE_TASK_DELETION || "").toLowerCase());
 const agentGrantScopes = enabledAgentScopes({ persistentTasksEnabled, remoteTaskDeletionEnabled });
+let RemoteTaskService;
+let createSftpTaskRemote;
+let TaskIndex;
+let taskOwnerKey;
+if (persistentTasksEnabled) {
+  ({ RemoteTaskService } = await import("./lib/remote-task-service.mjs"));
+  ({ createSftpTaskRemote } = await import("./lib/sftp-task-remote.mjs"));
+  ({ TaskIndex, taskOwnerKey } = await import("./lib/task-index.mjs"));
+}
 if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("--port must be between 1024 and 65535");
 if (!Number.isInteger(controlPort) || controlPort < 1024 || controlPort > 65535) throw new Error("--control-port must be between 1024 and 65535");
 
