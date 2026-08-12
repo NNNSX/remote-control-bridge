@@ -177,6 +177,10 @@ async function revokeAgentGrant(session) {
   if (grantId) { try { await control.revoke(grantId); } catch {} }
 }
 async function closeProxy(session) {
+  const opening = session.proxyOpening;
+  if (opening) {
+    await Promise.race([opening.catch(() => null), new Promise((resolve) => setTimeout(resolve, 2000))]);
+  }
   const proxy = session.proxy;
   if (!proxy) return;
   session.proxy = null;
