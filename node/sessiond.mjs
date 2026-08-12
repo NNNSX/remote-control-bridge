@@ -14,6 +14,7 @@ import { agentScopeForRequest, enabledAgentScopes, parseCommandRequest, tailText
 import { createControlClient } from "./lib/control-client.mjs";
 import { mediaTypeForPath } from "./lib/file-media.mjs";
 import { decodeTextPreview, isKnownBinaryPath, MAX_IMAGE_PREVIEW_BYTES, MAX_TEXT_PREVIEW_BYTES } from "./lib/file-preview.mjs";
+import { cpuUsageFromSamples } from "./lib/resource-status.mjs";
 import { AGENT_GRANT_TTL_SECONDS, createTerminal, ensureTerminal, scheduleAgentGrantRenewal, sessionConnectionPolicy, sshKeepaliveOptions, stopAgentGrantRenewal } from "./lib/session-policy.mjs";
 import { clearRecoveryCookie, issueSessionRecovery, recoverSession, recoveryCookie } from "./lib/session-recovery.mjs";
 import { SftpTusStore } from "./lib/sftp-tus-store.mjs";
@@ -247,9 +248,7 @@ async function collectStatus(session) {
     const before = String(fields.cpu_before || "").trim().split(/\s+/).map(Number);
     const after = String(fields.cpu_after || "").trim().split(/\s+/).map(Number);
     if (before.length >= 2 && after.length >= 2 && [...before, ...after].every(Number.isFinite)) {
-      const totalDelta = after[0] - before[0];
-      const busyDelta = totalDelta - (after[1] - before[1]);
-      cpu = { cores: Number.isFinite(cores) ? cores : null, usage_percent: totalDelta > 0 ? Math.max(0, Math.min(100, Number((busyDelta * 100 / totalDelta).toFixed(1)))) : null };
+      cpu = { cores: Number.isFinite(cores) ? cores : null, usage_percent: cpuUsageFromSamples(before, after) };
     }
     const memoryFields = String(fields.memory || "").trim().split(/\s+/).map(Number);
     if (memoryFields.length >= 4 && memoryFields.every(Number.isFinite)) memory = { total_kib: memoryFields[0], used_kib: memoryFields[1], available_kib: memoryFields[2], used_percent: memoryFields[3] };
