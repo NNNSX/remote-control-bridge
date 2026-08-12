@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import http from "node:http";
+import net from "node:net";
 import crypto from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
@@ -19,6 +20,7 @@ import { AGENT_GRANT_TTL_SECONDS, createTerminal, ensureTerminal, scheduleAgentG
 import { clearRecoveryCookie, issueSessionRecovery, recoverSession, recoveryCookie } from "./lib/session-recovery.mjs";
 import { SftpTusStore } from "./lib/sftp-tus-store.mjs";
 import { authorizeTusRequest } from "./lib/tus-request.mjs";
+import { handleSocksConnection } from "./lib/socks-proxy.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const options = {};
@@ -174,7 +176,47 @@ async function revokeAgentGrant(session) {
   session.controlGrantExpiresAt = null;
   if (grantId) { try { await control.revoke(grantId); } catch {} }
 }
-async function closeSession(session, endClient = true) { if (session.taskReconcileTimer) clearTimeout(session.taskReconcileTimer); sessions.delete(session.id); for (const job of session.jobs.values()) { job.cancel = true; job.stream?.close(); } if (endClient) { try { session.client.end(); } catch {} } await revokeAgentGrant(session); }
+async function closeProxy(session) {
+  const proxy = session.proxy;
+  if (!proxy) return;
+  session.proxy = null;
+  session.client.removeListener("tcp connection", proxy.onConnection);
+  await new Promise((resolve) => {
+    let settled = false;
+    const finish = () => { if (settled) return; settled = true; clearTimeout(timer); resolve(); };
+    const timer = setTimeout(finish, 2000);
+    timer.unref?.();
+    try { session.client.unforwardIn("127.0.0.1", proxy.port, finish); } catch { finish(); }
+  });
+}
+async function ensureProxy(session) {
+  if (session.proxy) return session.proxy;
+  if (session.proxyOpening) return session.proxyOpening;
+  const opening = new Promise((resolve, reject) => {
+    const onConnection = (details, accept, rejectConnection) => {
+      if (!session.proxy || details.destPort !== session.proxy.port) return rejectConnection();
+      const channel = accept();
+      if (channel) handleSocksConnection(channel, (options) => net.connect(options));
+    };
+    session.client.on("tcp connection", onConnection);
+    session.client.forwardIn("127.0.0.1", 0, (error, port) => {
+      if (error) { session.client.removeListener("tcp connection", onConnection); return reject(error); }
+      session.proxy = { host: "127.0.0.1", port, onConnection };
+      resolve(session.proxy);
+    });
+  });
+  session.proxyOpening = opening;
+  try { return await opening; }
+  finally { if (session.proxyOpening === opening) session.proxyOpening = null; }
+}
+function proxyEnvironment(proxy) {
+  const value = `socks5h://${proxy.host}:${proxy.port}`;
+  return `env ALL_PROXY=${value} all_proxy=${value} HTTP_PROXY=${value} HTTPS_PROXY=${value} http_proxy=${value} https_proxy=${value} PIP_PROXY=${value}`;
+}
+function proxyInfo(session) {
+  return { enabled: Boolean(session.proxy), proxy: session.proxy ? { host: session.proxy.host, port: session.proxy.port, scheme: "socks5h" } : null };
+}
+async function closeSession(session, endClient = true) { if (session.taskReconcileTimer) clearTimeout(session.taskReconcileTimer); sessions.delete(session.id); for (const job of session.jobs.values()) { job.cancel = true; job.stream?.close(); } await closeProxy(session); if (endClient) { try { session.client.end(); } catch {} } await revokeAgentGrant(session); }
 function sessionInfo(session) { return { session: session.id, host: session.host, port: session.port, username: session.username, fingerprint: session.fingerprint, agent_enabled: session.agentEnabled, ...sessionConnectionPolicy() }; }
 function getSession(idValue) { const session = sessions.get(idValue); if (!session) throw new Error("unknown or disconnected session"); return session; }
 async function agentSession(scope) {
@@ -272,13 +314,16 @@ function appendEvent(job, type, data) { job.events.push({ id: ++job.lastEvent, t
 function startJob(session, data) {
   const command = parseCommandRequest(data);
   const terminal = ensureTerminal(session, command, () => id("term"));
-  const job = { id: id("job"), command: command.command, status: "queued", stdout: "", stderr: "", events: [], lastEvent: 0, startedAt: null, finishedAt: null, cancel: false, terminalId: terminal.terminal_id, timeoutSeconds: command.timeout_seconds };
+  const job = { id: id("job"), command: command.command, proxy: command.proxy, status: "queued", stdout: "", stderr: "", events: [], lastEvent: 0, startedAt: null, finishedAt: null, cancel: false, terminalId: terminal.terminal_id, timeoutSeconds: command.timeout_seconds };
   session.jobs.set(job.id, job);
   terminal.jobs.push(job);
   terminal.current_job_id = job.id;
   terminal.busy = true;
   appendEvent(job, "status", { status: "queued" });
-  session.client.exec(command.command, (error, stream) => {
+  const launch = async () => {
+    const proxy = command.proxy ? await ensureProxy(session) : null;
+    const remoteCommand = proxy ? `${proxyEnvironment(proxy)} ${command.command}` : command.command;
+    session.client.exec(remoteCommand, (error, stream) => {
     if (error) return finishJob(job, "failed", { error: error.message });
     if (job.cancel) { try { stream.close(); } catch {} return finishJob(job, "cancelled"); }
     job.status = "running"; job.startedAt = Date.now(); appendEvent(job, "status", { status: "running" });
@@ -299,11 +344,13 @@ function startJob(session, data) {
     job.timeoutTimer = setTimeout(() => { if (!job.finishedAt) { job.cancel = true; job.timedOut = true; stream.close(); finishJob(job, "timed_out", { error: `command timed out after ${timeout}s`, timed_out: true }); } }, timeout * 1000);
     stream.on("close", (code, signal) => finishJob(job, job.timedOut ? "timed_out" : job.cancel ? "cancelled" : code === 0 ? "completed" : "failed", { exit_status: code, signal, timed_out: Boolean(job.timedOut) }));
     job.stream = stream;
-  });
+    });
+  };
+  launch().catch((error) => finishJob(job, "failed", { error: error.message }));
   return { job_id: job.id, terminal_id: terminal.terminal_id, status: job.status };
 }
 function finishJob(job, status, result = {}) { if (job.finishedAt) return; if (job.timeoutTimer) clearTimeout(job.timeoutTimer); job.status = status; job.finishedAt = Date.now(); job.result = result; const terminal = [...sessions.values()].flatMap((item) => [...item.terminals.values()]).find((item) => item.terminal_id === job.terminalId); if (terminal) { terminal.busy = false; terminal.current_job_id = null; } appendEvent(job, "status", { status }); appendEvent(job, "end", { status, ...result }); }
-function jobInfo(job) { return { job_id: job.id, command: job.command, status: job.status, stdout: job.stdout, stderr: job.stderr, started_at: job.startedAt, finished_at: job.finishedAt, events: job.events, exit_status: job.result?.exit_status ?? null, duration_ms: job.startedAt && job.finishedAt ? job.finishedAt - job.startedAt : null, timeout_seconds: job.timeoutSeconds, truncated: Boolean(job.truncated) }; }
+function jobInfo(job) { return { job_id: job.id, command: job.command, proxy: Boolean(job.proxy), status: job.status, stdout: job.stdout, stderr: job.stderr, started_at: job.startedAt, finished_at: job.finishedAt, events: job.events, exit_status: job.result?.exit_status ?? null, duration_ms: job.startedAt && job.finishedAt ? job.finishedAt - job.startedAt : null, timeout_seconds: job.timeoutSeconds, truncated: Boolean(job.truncated) }; }
 
 function streamJobEvents(request, response, job) {
   const last = Number(request.headers["last-event-id"] || 0);
@@ -512,6 +559,9 @@ const server = http.createServer(async (request, response) => {
       if (request.method === "GET" && suffix === "session") return json(response, 200, { session: session.id, host: session.host, port: session.port, username: session.username, enabled: true, ...sessionConnectionPolicy() });
       if (request.method === "GET" && suffix === "status") return json(response, 200, { ...(await collectStatus(session)), session: session.id });
       if (request.method === "GET" && suffix === "terminals") return json(response, 200, { session: session.id, terminals: [...session.terminals.values()].map((terminal) => ({ ...terminal, jobs: terminal.jobs.map(jobInfo) })) });
+      if (request.method === "GET" && suffix === "proxy") return json(response, 200, { ...proxyInfo(session), session: session.id });
+      if (request.method === "POST" && suffix === "proxy") { const proxy = await ensureProxy(session); return json(response, 201, { ...proxyInfo(session), proxy: { host: proxy.host, port: proxy.port, scheme: "socks5h" }, session: session.id }); }
+      if (request.method === "DELETE" && suffix === "proxy") { await closeProxy(session); return json(response, 200, { ...proxyInfo(session), session: session.id }); }
       if (request.method === "POST" && suffix === "commands") return json(response, 202, startJob(session, await readBody(request)));
       const jobMatch = suffix.match(/^jobs\/([^/]+)$/);
       if (jobMatch && request.method === "GET") { const job = session.jobs.get(jobMatch[1]); if (!job) return json(response, 404, { error: "unknown job" }); return json(response, 200, jobInfo(job)); }
@@ -585,6 +635,9 @@ const server = http.createServer(async (request, response) => {
       const session = getSession(match[1]); const suffix = match[2] || "";
       if (request.method === "GET" && suffix === "status") return json(response, 200, { ...(await collectStatus(session)), jobs: [...session.jobs.values()].map(jobInfo) });
       if (request.method === "GET" && suffix === "terminals") return json(response, 200, { terminals: [...session.terminals.values()].map((terminal) => ({ ...terminal, jobs: terminal.jobs.map(jobInfo) })) });
+      if (request.method === "GET" && suffix === "proxy") return json(response, 200, proxyInfo(session));
+      if (request.method === "POST" && suffix === "proxy") { const proxy = await ensureProxy(session); return json(response, 201, { ...proxyInfo(session), proxy: { host: proxy.host, port: proxy.port, scheme: "socks5h" } }); }
+      if (request.method === "DELETE" && suffix === "proxy") { await closeProxy(session); return json(response, 200, proxyInfo(session)); }
       if (request.method === "GET" && suffix === "transfers") return json(response, 200, { transfers: await transferStore.listForSession(session) });
       const transferMatch = suffix.match(/^transfers\/([^/]+)$/);
       if (transferMatch && request.method === "DELETE") return json(response, 200, await transferStore.discardForSession(transferMatch[1], session));

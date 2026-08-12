@@ -12,6 +12,9 @@ test("Agent routes map only to their required scopes", () => {
   assert.deepEqual(enabledAgentScopes({ persistentTasksEnabled: true, remoteTaskDeletionEnabled: true }), [...AGENT_SCOPES, "tasks:delete"]);
   assert.equal(agentScopeForRequest("GET", "session"), "status:read");
   assert.equal(agentScopeForRequest("POST", "commands"), "jobs:execute");
+  assert.equal(agentScopeForRequest("GET", "proxy"), "jobs:read");
+  assert.equal(agentScopeForRequest("POST", "proxy"), "jobs:execute");
+  assert.equal(agentScopeForRequest("DELETE", "proxy"), "jobs:cancel");
   assert.equal(agentScopeForRequest("GET", "jobs/job-1/events"), "jobs:read");
   assert.equal(agentScopeForRequest("DELETE", "jobs/job-1"), "jobs:cancel");
   assert.equal(agentScopeForRequest("GET", "files/preview"), "files:read");
@@ -37,11 +40,12 @@ test("Agent routes map only to their required scopes", () => {
 });
 
 test("Agent command requests have one validated timeout contract", () => {
-  assert.deepEqual(parseCommandRequest({ command: "pwd" }), { command: "pwd", timeout_seconds: 120, terminal_id: null, new_terminal: false });
-  assert.deepEqual(parseCommandRequest({ command: "echo ok", timeout_seconds: 5, terminal_id: "term-1", new_terminal: false }), { command: "echo ok", timeout_seconds: 5, terminal_id: "term-1", new_terminal: false });
+  assert.deepEqual(parseCommandRequest({ command: "pwd" }), { command: "pwd", timeout_seconds: 120, terminal_id: null, new_terminal: false, proxy: false });
+  assert.deepEqual(parseCommandRequest({ command: "echo ok", timeout_seconds: 5, terminal_id: "term-1", new_terminal: false, proxy: true }), { command: "echo ok", timeout_seconds: 5, terminal_id: "term-1", new_terminal: false, proxy: true });
   assert.throws(() => parseCommandRequest({ command: "pwd", timeout_seconds: 0 }), /between 1 and 3600/);
   assert.throws(() => parseCommandRequest({ command: "pwd", timeout_seconds: "5" }), /between 1 and 3600/);
   assert.throws(() => parseCommandRequest({ command: "pwd", new_terminal: "yes" }), /must be a boolean/);
+  assert.throws(() => parseCommandRequest({ command: "pwd", proxy: "yes" }), /must be a boolean/);
 });
 
 test("log tails count content lines instead of the trailing newline", () => {

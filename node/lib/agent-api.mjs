@@ -11,7 +11,9 @@ export function agentScopeForRequest(method, suffix) {
   const route = String(suffix || "").replace(/^\/+/, "");
   if (verb === "GET" && (route === "session" || route === "status")) return "status:read";
   if (verb === "GET" && route === "terminals") return "jobs:read";
-  if (verb === "POST" && route === "commands") return "jobs:execute";
+  if (verb === "POST" && (route === "commands" || route === "proxy")) return "jobs:execute";
+  if (verb === "GET" && route === "proxy") return "jobs:read";
+  if (verb === "DELETE" && route === "proxy") return "jobs:cancel";
   if (verb === "GET" && /^jobs\/[^/]+(?:\/events)?$/.test(route)) return "jobs:read";
   if (verb === "DELETE" && /^jobs\/[^/]+$/.test(route)) return "jobs:cancel";
   if (verb === "GET" && ["files", "files/preview", "files/media", "files/download"].includes(route)) return "files:read";
@@ -33,11 +35,13 @@ export function parseCommandRequest(value) {
   if (!Number.isInteger(timeout) || timeout < 1 || timeout > 3600) throw new Error("timeout_seconds must be an integer between 1 and 3600");
   if (value.terminal_id != null && (typeof value.terminal_id !== "string" || !value.terminal_id || value.terminal_id.length > 128)) throw new Error("terminal_id must be a non-empty string of at most 128 characters");
   if (value.new_terminal != null && typeof value.new_terminal !== "boolean") throw new Error("new_terminal must be a boolean");
+  if (value.proxy != null && typeof value.proxy !== "boolean") throw new Error("proxy must be a boolean");
   return {
     command: value.command,
     timeout_seconds: timeout,
     terminal_id: value.terminal_id || null,
     new_terminal: Boolean(value.new_terminal),
+    proxy: Boolean(value.proxy),
   };
 }
 

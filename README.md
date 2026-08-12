@@ -25,6 +25,6 @@ Agent 使用 `files:read` 读取文件，使用 `files:write` 直接调用文件
 - 未知 SSH 主机指纹必须由用户确认
 - 密码只用于建立连接，不写入配置、日志或任务记录
 - Agent 授权绑定主机、端口、用户名和已确认的 SSH 指纹，并可立即撤销
-- 不提供通用 SOCKS、HTTP 或公网代理
+- 可按 SSH 会话启用受控的远端回环 SOCKS5 转发，供明确标记的远程命令临时使用
 
 安装、启动、配置、Agent API 和验证命令见 [`SKILL.md`](SKILL.md)。
