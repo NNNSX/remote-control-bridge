@@ -40,7 +40,7 @@
       </nav>
       <div id="notice" class="notice">输入 SSH 信息后连接服务器。</div>
       <div id="emptyWorkspace" class="empty-workspace"><strong>尚未连接远程服务器</strong><span>填写左侧 SSH 信息并连接后，这里会显示状态、终端、日志和文件管理。</span></div>
-      <div class="monitor-toolbar"><label>自动刷新<select id="refreshInterval" disabled><option value="5">5 秒</option><option value="15" selected>15 秒</option><option value="30">30 秒</option><option value="60">60 秒</option><option value="0">关闭</option></select></label><button id="pauseMonitoring" type="button" disabled>暂停监控</button><span id="lastRefresh" class="last-refresh">尚未采集</span><span id="alertBadge" class="alert-badge" hidden></span></div>
+      <div class="monitor-toolbar"><label>自动刷新<select id="refreshInterval" disabled><option value="5" selected>5 秒</option><option value="15">15 秒</option><option value="30">30 秒</option><option value="60">60 秒</option><option value="0">关闭</option></select></label><button id="pauseMonitoring" type="button" disabled>暂停监控</button><span id="lastRefresh" class="last-refresh">尚未采集</span><span id="alertBadge" class="alert-badge" hidden></span></div>
       <div id="dashboard" class="dashboard"></div>
       <section id="jobOverview" class="job-overview" hidden><div class="section-heading"><h2>活动任务</h2><span id="jobCount"></span></div><div id="jobRows"></div></section>
       <section class="workspace-section terminal" data-view-panel="terminal">

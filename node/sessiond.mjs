@@ -272,6 +272,7 @@ async function collectStatus(session) {
   let memory = null;
   let rootDisk = null;
   let gpus = [];
+  let gpuProcesses = [];
   const systemCommand = [
     "printf 'hostname='; hostname 2>/dev/null || true",
     "printf 'uptime='; awk '{print int($1)}' /proc/uptime 2>/dev/null || true",
@@ -284,7 +285,8 @@ async function collectStatus(session) {
     "printf 'disk='; df -Pk \"$HOME\" 2>/dev/null | awk 'NR==2 {gsub(/%/,\"\",$5); print $2,$3,$4,$5}'",
   ].join("; ");
   const gpuCommand = "if command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits; fi";
-  const [systemResult, gpuResult] = await Promise.allSettled([execOnce(session.client, systemCommand), execOnce(session.client, gpuCommand)]);
+  const gpuProcessCommand = "if command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader,nounits; fi";
+  const [systemResult, gpuResult, gpuProcessResult] = await Promise.allSettled([execOnce(session.client, systemCommand), execOnce(session.client, gpuCommand), execOnce(session.client, gpuProcessCommand)]);
   if (systemResult.status === "fulfilled") {
     const fields = Object.fromEntries(systemResult.value.split(/\r?\n/).map((line) => line.split(/=(.*)/s).slice(0, 2)).filter((parts) => parts.length === 2));
     if (fields.hostname) hostname = fields.hostname.trim();
@@ -310,8 +312,17 @@ async function collectStatus(session) {
       return { index: number(fields[0]), name: fields[1], utilization_percent: number(fields[2]), memory_used_mib: number(fields[3]), memory_total_mib: number(fields[4]), temperature_c: number(fields[5]) };
     }).filter(Boolean);
   }
-  const samplingErrors = [...(systemResult.status === "rejected" ? ["system"] : []), ...(gpuResult.status === "rejected" ? ["gpu"] : [])];
-  return { host: session.host, port: session.port, username: session.username, hostname, uptime_seconds: uptime, workdir: "$HOME", load_average: loadAverage, cpu, memory, root_disk: rootDisk, gpus, sample_status: samplingErrors.length ? "partial" : "complete", sampling_errors: samplingErrors, collected_at: Math.floor(Date.now() / 1000) };
+  if (gpuProcessResult.status === "fulfilled") {
+    gpuProcesses = gpuProcessResult.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => {
+      const fields = line.split(/\s*,\s*/);
+      if (fields.length < 4) return null;
+      const pid = Number(fields[1]);
+      const usedMemory = Number(String(fields[3]).replace(/[^0-9.+-]/g, ""));
+      return { gpu_uuid: fields[0], pid: Number.isFinite(pid) ? pid : null, process_name: fields[2], used_memory_mib: Number.isFinite(usedMemory) ? usedMemory : null };
+    }).filter(Boolean);
+  }
+  const samplingErrors = [...(systemResult.status === "rejected" ? ["system"] : []), ...(gpuResult.status === "rejected" ? ["gpu"] : []), ...(gpuProcessResult.status === "rejected" ? ["gpu_processes"] : [])];
+  return { host: session.host, port: session.port, username: session.username, hostname, uptime_seconds: uptime, workdir: "$HOME", load_average: loadAverage, cpu, memory, root_disk: rootDisk, gpus, gpu_processes: gpuProcesses, sample_status: samplingErrors.length ? "partial" : "complete", sampling_errors: samplingErrors, collected_at: Math.floor(Date.now() / 1000) };
 }
 
 function appendEvent(job, type, data) { job.events.push({ id: ++job.lastEvent, type, data }); if (job.events.length > 512) job.events.shift(); }
