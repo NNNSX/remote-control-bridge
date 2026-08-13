@@ -345,7 +345,10 @@ function startJob(session, data) {
     stream.on("data", (chunk) => appendOutput("stdout", chunk, "stdout"));
     stream.stderr.on("data", (chunk) => appendOutput("stderr", chunk, "stderr"));
     const timeout = command.timeout_seconds;
-    job.timeoutTimer = setTimeout(() => { if (!job.finishedAt) { job.cancel = true; job.timedOut = true; stream.close(); finishJob(job, "timed_out", { error: `command timed out after ${timeout}s`, timed_out: true }); } }, timeout * 1000);
+    if (timeout !== null) {
+      job.timeoutTimer = setTimeout(() => { if (!job.finishedAt) { job.cancel = true; job.timedOut = true; stream.close(); finishJob(job, "timed_out", { error: `command timed out after ${timeout}s`, timed_out: true }); } }, timeout * 1000);
+      job.timeoutTimer.unref?.();
+    }
     stream.on("close", (code, signal) => finishJob(job, job.timedOut ? "timed_out" : job.cancel ? "cancelled" : code === 0 ? "completed" : "failed", { exit_status: code, signal, timed_out: Boolean(job.timedOut) }));
     job.stream = stream;
     });

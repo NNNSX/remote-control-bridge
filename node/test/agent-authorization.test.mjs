@@ -263,7 +263,7 @@ test("Agent access requires a fingerprint-bound Control grant and revokes immedi
   }, children);
   assert.equal(completed.status, "completed");
   assert.equal(completed.stdout, "authorized");
-  assert.equal(completed.timeout_seconds, 120);
+  assert.equal(completed.timeout_seconds, null);
 
   response = await fetch(`${api}/sessions/${sessionId}/agent`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: false }) });
   assert.equal(response.status, 200);

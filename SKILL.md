@@ -93,7 +93,7 @@ File operations do not add business-level size, overwrite, or permission policy.
 
 ## Jobs and optional Persistent Tasks
 
-- Use `POST /api/v1/agent/commands` for bounded interactive commands and observe the returned job until a terminal state.
+- Use `POST /api/v1/agent/commands` to submit commands. Commands have no automatic timeout by default; pass a positive `timeout_seconds` only when an explicit command-level timeout is desired. Observe the returned job until a terminal state or cancel it explicitly.
 - Use `POST /api/v1/agent/proxy` to create a session-scoped SOCKS5 proxy on the remote loopback interface. Pass `proxy: true` in a command request to inject temporary `ALL_PROXY`/`HTTP_PROXY`/`HTTPS_PROXY` variables for that command. Use `DELETE /api/v1/agent/proxy` when finished.
 - A proxy-enabled command request looks like `{ "command": "python -m pip install ...", "proxy": true }`; the bridge also sets `PIP_PROXY` for pip-compatible clients. SOCKS support still depends on the remote client and its installed dependencies.
 - Use `POST /api/v1/agent/tasks` only for work expected to outlive the current observation turn. Record the returned `task_id`, stop observing after a short snapshot, and query it later through task status/history/log endpoints.

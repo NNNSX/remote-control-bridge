@@ -39,11 +39,13 @@ test("Agent routes map only to their required scopes", () => {
   assert.equal(agentScopeForRequest("GET", "unknown"), null);
 });
 
-test("Agent command requests have one validated timeout contract", () => {
-  assert.deepEqual(parseCommandRequest({ command: "pwd" }), { command: "pwd", timeout_seconds: 120, terminal_id: null, new_terminal: false, proxy: false });
+test("Agent command requests allow uncapped execution with optional explicit timeout", () => {
+  assert.deepEqual(parseCommandRequest({ command: "pwd" }), { command: "pwd", timeout_seconds: null, terminal_id: null, new_terminal: false, proxy: false });
+  assert.deepEqual(parseCommandRequest({ command: "pwd", timeout_seconds: null }), { command: "pwd", timeout_seconds: null, terminal_id: null, new_terminal: false, proxy: false });
   assert.deepEqual(parseCommandRequest({ command: "echo ok", timeout_seconds: 5, terminal_id: "term-1", new_terminal: false, proxy: true }), { command: "echo ok", timeout_seconds: 5, terminal_id: "term-1", new_terminal: false, proxy: true });
-  assert.throws(() => parseCommandRequest({ command: "pwd", timeout_seconds: 0 }), /between 1 and 3600/);
-  assert.throws(() => parseCommandRequest({ command: "pwd", timeout_seconds: "5" }), /between 1 and 3600/);
+  assert.deepEqual(parseCommandRequest({ command: "pwd", timeout_seconds: 3601 }), { command: "pwd", timeout_seconds: 3601, terminal_id: null, new_terminal: false, proxy: false });
+  assert.throws(() => parseCommandRequest({ command: "pwd", timeout_seconds: 0 }), /null or a positive integer/);
+  assert.throws(() => parseCommandRequest({ command: "pwd", timeout_seconds: "5" }), /null or a positive integer/);
   assert.throws(() => parseCommandRequest({ command: "pwd", new_terminal: "yes" }), /must be a boolean/);
   assert.throws(() => parseCommandRequest({ command: "pwd", proxy: "yes" }), /must be a boolean/);
 });

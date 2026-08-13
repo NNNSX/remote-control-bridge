@@ -31,8 +31,8 @@ export function agentScopeForRequest(method, suffix) {
 export function parseCommandRequest(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("command request must be an object");
   if (typeof value.command !== "string" || !value.command.trim() || value.command.length > 65536) throw new Error("command must contain between 1 and 65536 characters");
-  const timeout = value.timeout_seconds == null ? 120 : value.timeout_seconds;
-  if (!Number.isInteger(timeout) || timeout < 1 || timeout > 3600) throw new Error("timeout_seconds must be an integer between 1 and 3600");
+  const timeout = value.timeout_seconds == null ? null : value.timeout_seconds;
+  if (timeout !== null && (!Number.isSafeInteger(timeout) || timeout < 1)) throw new Error("timeout_seconds must be null or a positive integer");
   if (value.terminal_id != null && (typeof value.terminal_id !== "string" || !value.terminal_id || value.terminal_id.length > 128)) throw new Error("terminal_id must be a non-empty string of at most 128 characters");
   if (value.new_terminal != null && typeof value.new_terminal !== "boolean") throw new Error("new_terminal must be a boolean");
   if (value.proxy != null && typeof value.proxy !== "boolean") throw new Error("proxy must be a boolean");
